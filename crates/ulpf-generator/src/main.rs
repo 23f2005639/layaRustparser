@@ -350,8 +350,9 @@ async fn send_udp_batch_one_by_one(socket: &UdpSocket, batch: &[&[u8]]) -> (u64,
 /// Outcome of one `sendmmsg` syscall. Owns no pointers, so the async retry
 /// loop can match on it without holding raw `iovec` borrows across `.await`.
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MmsgOutcome {
-    Sent(usize),
+    Sent { count: usize, bytes: u64 },
     Empty,
     WaitWritable,
     Retry,
@@ -415,7 +416,12 @@ fn sendmmsg_once(fd: libc::c_int, headers: &mut [libc::mmsghdr]) -> MmsgOutcome 
     if ret == 0 {
         return MmsgOutcome::Empty;
     }
-    MmsgOutcome::Sent(ret as usize)
+    let n = ret as usize;
+    let mut bytes = 0u64;
+    for hdr in headers.iter().take(n) {
+        bytes += hdr.msg_len as u64;
+    }
+    MmsgOutcome::Sent { count: n, bytes }
 }
 
 /// Batched send via `sendmmsg` on the tokio socket's fd. The socket stays
@@ -428,41 +434,102 @@ async fn send_udp_batch_sendmmsg(socket: &UdpSocket, batch: &[&[u8]]) -> (u64, u
     if batch.is_empty() {
         return (0, 0, 0);
     }
-    let fd = socket.as_raw_fd();
-    // One build per batch; partial sends resume at `sent` without rebuilding.
-    let mut bufs = mmsg_bufs(batch);
+    let mut transport = SocketTransport {
+        fd: socket.as_raw_fd(),
+        socket,
+        batch,
+        // One build per batch; partial sends resume at `sent` without rebuilding.
+        bufs: mmsg_bufs(batch),
+    };
+    mmsg_drive_loop(batch.len(), &mut transport).await
+}
 
+/// Seam between the `sendmmsg` retry loop and the socket. The production
+/// impl below drives the real fd; tests inject a scripted fake so
+/// partial-send and persistent-EAGAIN transitions are covered without
+/// touching the network.
+#[cfg(target_os = "linux")]
+trait MmsgTransport {
+    fn send_step(&mut self, sent: usize) -> MmsgOutcome;
+    fn wait_writable(&mut self) -> impl std::future::Future<Output = bool> + Send;
+    fn fallback_from(
+        &mut self,
+        sent: usize,
+    ) -> impl std::future::Future<Output = (u64, u64, u64)> + Send;
+}
+
+/// Shared retry loop over `MmsgOutcome`s. Counts every datagram exactly
+/// once: `sent` successes stay in the total even when the remainder falls
+/// back to per-packet sends after a hard error, and every EAGAIN is gated
+/// on one transport wait so the loop can never busy-spin the syscall.
+#[cfg(target_os = "linux")]
+async fn mmsg_drive_loop(batch_len: usize, transport: &mut impl MmsgTransport) -> (u64, u64, u64) {
     let mut sent = 0usize;
     let mut bytes = 0u64;
     let mut errors = 0u64;
-    while sent < batch.len() {
-        match sendmmsg_once(fd, &mut bufs.headers[sent..]) {
+    while sent < batch_len {
+        match transport.send_step(sent) {
             MmsgOutcome::Retry => continue,
             MmsgOutcome::Empty => {
                 // Should not happen for datagrams; yield, don't hot-spin.
                 tokio::task::yield_now().await;
             }
             MmsgOutcome::WaitWritable => {
-                if socket.writable().await.is_err() {
-                    errors += (batch.len() - sent) as u64;
+                if !transport.wait_writable().await {
+                    errors += (batch_len - sent) as u64;
                     break;
                 }
             }
             // e.g. EMSGSIZE for one oversize datagram aborts the whole call,
             // so drain the rest one by one like before.
             MmsgOutcome::FallbackRemainder => {
-                let (p, b, e) = send_udp_batch_one_by_one(socket, &batch[sent..]).await;
-                return (p, bytes + b, errors + e);
+                let (p, b, e) = transport.fallback_from(sent).await;
+                return (sent as u64 + p, bytes + b, errors + e);
             }
-            MmsgOutcome::Sent(n) => {
-                for hdr in &bufs.headers[sent..sent + n] {
-                    bytes += hdr.msg_len as u64;
-                }
-                sent += n;
+            MmsgOutcome::Sent { count, bytes: n } => {
+                bytes += n;
+                sent += count;
             }
         }
     }
     (sent as u64, bytes, errors)
+}
+
+/// Production transport: raw `sendmmsg` on the tokio socket's fd plus the
+/// per-packet fallback. Owns the scratch `MmsgBufs` (whose raw pointers
+/// point at its own iovec allocation and the batch's log bytes) so nothing
+/// dangles across `.await` points; `Send` holds via the `MmsgBufs` impl
+/// below because no other thread can ever observe the pointers.
+#[cfg(target_os = "linux")]
+struct SocketTransport<'s, 'b> {
+    fd: libc::c_int,
+    socket: &'s UdpSocket,
+    batch: &'b [&'b [u8]],
+    bufs: MmsgBufs,
+}
+
+#[cfg(target_os = "linux")]
+impl MmsgTransport for SocketTransport<'_, '_> {
+    fn send_step(&mut self, sent: usize) -> MmsgOutcome {
+        sendmmsg_once(self.fd, &mut self.bufs.headers[sent..])
+    }
+
+    async fn wait_writable(&mut self) -> bool {
+        // Clear Tokio's cached readiness before awaiting: the raw syscall
+        // above runs outside `try_io`, so without this the readiness bit
+        // from before the EAGAIN can stay set and `writable().await` would
+        // return immediately, spinning the syscall while the socket is
+        // still blocked. A guaranteed-`WouldBlock` `try_io` resets the bit
+        // so the await genuinely sleeps until the socket is writable.
+        let _ = self.socket.try_io(tokio::io::Interest::WRITABLE, || {
+            Err::<(), std::io::Error>(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        });
+        self.socket.writable().await.is_ok()
+    }
+
+    async fn fallback_from(&mut self, sent: usize) -> (u64, u64, u64) {
+        send_udp_batch_one_by_one(self.socket, &self.batch[sent..]).await
+    }
 }
 
 async fn run_udp_worker(
