@@ -272,6 +272,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Returns how many packets to send this batch, sleeping first if the worker
+/// is ahead of its target rate.
+///
+/// Previously this slept a fixed 500us and re-polled, tying pacing resolution
+/// to the send path: the worker burned loop trips just to re-check the clock.
+/// Sleeping once until the exact deadline the deficit implies decouples the
+/// two — one timer wait per batch instead of a poll loop.
+async fn next_batch_size(
+    sent_count: u64,
+    worker_start: Instant,
+    target_rate: u64,
+    batch_size: usize,
+) -> usize {
+    if target_rate == 0 {
+        return batch_size;
+    }
+    let expected = worker_start.elapsed().as_secs_f64() * target_rate as f64;
+    if sent_count as f64 > expected + batch_size as f64 {
+        let ahead_secs = (sent_count as f64 - expected) / target_rate as f64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(ahead_secs.max(0.0));
+        tokio::time::sleep_until(deadline).await;
+        return 0; // re-evaluate after the sleep; send nothing this trip
+    }
+    batch_size.min((expected as u64).saturating_sub(sent_count).max(1) as usize)
+}
+
 async fn run_udp_worker(
     worker_id: usize,
     target: SocketAddr,
@@ -305,18 +331,11 @@ async fn run_udp_worker(
     let mut sent_count = 0u64;
 
     while running.load(Ordering::Relaxed) {
-        let to_send = if target_rate > 0 {
-            // Adaptive rate controller
-            let expected_sent = (worker_start.elapsed().as_secs_f64() * target_rate as f64) as u64;
-            if sent_count > expected_sent + (batch_size as u64) {
-                // Ahead of schedule, pause briefly
-                tokio::time::sleep(Duration::from_micros(500)).await;
-                continue;
-            }
-            batch_size.min((expected_sent.saturating_sub(sent_count) as usize).max(1))
-        } else {
-            batch_size
-        };
+        let to_send =
+            next_batch_size(sent_count, worker_start, target_rate, batch_size).await;
+        if to_send == 0 {
+            continue;
+        }
 
         let mut batch_bytes = 0u64;
         let mut batch_pkts = 0u64;
@@ -390,16 +409,11 @@ async fn run_tcp_worker(
     let mut send_buf = Vec::with_capacity(batch_size * 256);
 
     while running.load(Ordering::Relaxed) {
-        let to_send = if target_rate > 0 {
-            let expected_sent = (worker_start.elapsed().as_secs_f64() * target_rate as f64) as u64;
-            if sent_count > expected_sent + (batch_size as u64) {
-                tokio::time::sleep(Duration::from_micros(500)).await;
-                continue;
-            }
-            batch_size.min((expected_sent.saturating_sub(sent_count) as usize).max(1))
-        } else {
-            batch_size
-        };
+        let to_send =
+            next_batch_size(sent_count, worker_start, target_rate, batch_size).await;
+        if to_send == 0 {
+            continue;
+        }
 
         send_buf.clear();
         for _ in 0..to_send {
