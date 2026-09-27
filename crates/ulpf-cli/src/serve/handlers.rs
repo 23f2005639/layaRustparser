@@ -656,8 +656,11 @@ pub async fn post_parsers_test(
                 sample_logs: vec![raw.to_string()],
                 confidence_score: 1.0,
                 created_at: Utc::now().timestamp_millis(),
+                regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
-            def.parse(raw).ok()
+            // Reuse the `re` already compiled above instead of recompiling
+            // the same pattern inside the definition's cache.
+            def.parse_with_regex(&re, raw).ok()
         } else {
             None
         };
@@ -697,6 +700,123 @@ pub async fn post_parsers_test(
         protocol_detected,
         notes: "Parsed through dynamic registry / universal baseline (read-only)".to_string(),
     }))
+}
+
+/// Temp-file disambiguator so concurrent onboard requests never share a name.
+static PUBLISH_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Atomically publish the JSON+YAML parser pair.
+///
+/// Both payloads are written to temp files in the SAME directory, then
+/// `rename`d over their targets. `rename(2)` is atomic on POSIX: readers
+/// (e.g. `GET /parsers`) never observe a half-written definition, and a
+/// crash between the two renames leaves at worst one stale-but-whole file —
+/// never a truncated one. Temps live beside their targets so the rename
+/// stays on one filesystem (no cross-device hop).
+///
+/// On any failure the temp files are removed and any already-renamed target
+/// is rolled back to its prior contents (or removed if it did not exist),
+/// so there is no window where only one half of the pair exists.
+///
+/// A rollback that itself fails is NOT swallowed: the returned error names
+/// both the original publish failure and whatever could not be undone, because
+/// silently reporting only the first would leave a caller believing the
+/// directory is clean when it is not.
+fn publish_parser_pair(
+    dir: &std::path::Path,
+    json_file: &str,
+    yaml_file: &str,
+    json_str: &str,
+    yaml_str: &str,
+) -> std::io::Result<()> {
+    let json_path = dir.join(json_file);
+    let yaml_path = dir.join(yaml_file);
+
+    // Snapshot BEFORE touching anything, so a rollback restores rather than
+    // deletes a parser that was already published.
+    let prior_json = std::fs::read(&json_path).ok();
+    let prior_yaml = std::fs::read(&yaml_path).ok();
+
+    let tag = format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        PUBLISH_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let json_tmp = dir.join(format!("{json_file}.{tag}"));
+    let yaml_tmp = dir.join(format!("{yaml_file}.{tag}"));
+
+    // Clean up the temps, then undo any rename that already happened. Targets
+    // that were never renamed are untouched — the originals are still whole on
+    // disk. Restores go through their own temp + rename for the same reason the
+    // publish does: a plain `write` to the target truncates it first, so a
+    // failed restore would leave the previous definition destroyed rather than
+    // merely unreverted.
+    let rollback = |json_renamed: bool, yaml_renamed: bool| -> std::io::Result<()> {
+        let mut problems: Vec<String> = Vec::new();
+        // A temp that is already gone is the EXPECTED case, not a problem: the
+        // half that renamed successfully no longer has one. Reporting it would
+        // make every clean rollback claim to be incomplete.
+        let mut drop_temp = |r: std::io::Result<()>, what: &str| match r {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => problems.push(format!("{what}: {e}")),
+            Ok(()) => {}
+        };
+
+        drop_temp(std::fs::remove_file(&json_tmp), "temp json");
+        drop_temp(std::fs::remove_file(&yaml_tmp), "temp yaml");
+        for (path, prior, renamed, what) in [
+            (&json_path, &prior_json, json_renamed, "json"),
+            (&yaml_path, &prior_yaml, yaml_renamed, "yaml"),
+        ] {
+            if !renamed {
+                continue;
+            }
+            let r = match prior {
+                Some(bytes) => {
+                    let restore_tmp = dir.join(format!(
+                        "{}.rollback-{tag}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    std::fs::write(&restore_tmp, bytes)
+                        .and_then(|()| std::fs::rename(&restore_tmp, path))
+                }
+                None => std::fs::remove_file(path),
+            };
+            if let Err(e) = r {
+                problems.push(format!("{what}: {e}"));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(problems.join("; ")))
+        }
+    };
+
+    // Stage BOTH payloads before either becomes visible: a failure here
+    // leaves the originals untouched.
+    let fail = |e: std::io::Error, json_renamed: bool, yaml_renamed: bool| match rollback(
+        json_renamed,
+        yaml_renamed,
+    ) {
+        Ok(()) => e,
+        Err(rollback_err) => std::io::Error::other(format!(
+            "publish failed: {e}; and the rollback was incomplete: {rollback_err}"
+        )),
+    };
+
+    if let Err(e) =
+        std::fs::write(&json_tmp, json_str).and_then(|()| std::fs::write(&yaml_tmp, yaml_str))
+    {
+        return Err(fail(e, false, false));
+    }
+    if let Err(e) = std::fs::rename(&json_tmp, &json_path) {
+        return Err(fail(e, false, false));
+    }
+    if let Err(e) = std::fs::rename(&yaml_tmp, &yaml_path) {
+        return Err(fail(e, true, false));
+    }
+    Ok(())
 }
 
 /// POST /onboard
@@ -765,7 +885,20 @@ pub async fn post_onboard(
     }
 
     // Persist parser to data/parsers/
-    let _ = std::fs::create_dir_all(&state.parsers_dir);
+    // Surface the cause here rather than letting it resurface as a misleading
+    // "failed writing parser JSON" at the write below.
+    std::fs::create_dir_all(&state.parsers_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Disk Write Error".to_string(),
+                code: 500,
+                message: format!("Failed creating parsers directory: {}", e),
+                block_id: None,
+                leaf_index: None,
+            }),
+        )
+    })?;
     let mut vendor_slug: String = payload
         .vendor
         .to_lowercase()
@@ -783,6 +916,13 @@ pub async fn post_onboard(
     }
     let json_file = format!("{}.json", vendor_slug);
     let yaml_file = format!("{}.yaml", vendor_slug);
+
+    // Take the persistence lock BEFORE snapshotting: the snapshot, the two
+    // renames, and any rollback are one transaction over this slug. Without it
+    // two concurrent requests for the same vendor interleave and the loser's
+    // rollback can delete the winner's published pair. Held across the `await`
+    // on the registry below, so a parser is never left on disk unregistered.
+    let _persist_guard = state.persist_lock.lock().await;
 
     let json_path = state.parsers_dir.join(&json_file);
     let yaml_path = state.parsers_dir.join(&yaml_file);
@@ -813,20 +953,31 @@ pub async fn post_onboard(
         )
     })?;
 
-    std::fs::write(&json_path, json_str).map_err(|e| {
+    // Persist the parser definition as a PAIR (JSON for the loader, YAML for
+    // humans) — atomically. `publish_parser_pair` tmp-writes both payloads
+    // then renames them over the targets, so readers never see a
+    // half-published definition and a crash mid-write leaves whole files
+    // behind, never truncated ones.
+    let disk_err = |what: &str, e: std::io::Error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: "Disk Write Error".to_string(),
                 code: 500,
-                message: format!("Failed writing parser JSON to disk: {}", e),
+                message: format!("Failed writing parser {what} to disk: {e}"),
                 block_id: None,
                 leaf_index: None,
             }),
         )
-    })?;
-
-    let _ = std::fs::write(&yaml_path, yaml_str);
+    };
+    publish_parser_pair(
+        &state.parsers_dir,
+        &json_file,
+        &yaml_file,
+        &json_str,
+        &yaml_str,
+    )
+    .map_err(|e| disk_err("JSON+YAML pair", e))?;
 
     // Hot-load into active registry
     {
@@ -1226,4 +1377,148 @@ pub async fn get_export_bundle(
     );
 
     Ok((headers, bundle_bytes).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fresh temp dir per test (pid-tagged): publish tests must not share
+    /// state, and must not touch the repo's real `data/parsers`.
+    fn scratch_dir(case: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ulpf-publish-test-{}-{}-{}",
+            case,
+            std::process::id(),
+            PUBLISH_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        dir
+    }
+
+    /// No temp files may survive a publish — a leftover `*.tmp-*` is a
+    /// half-published definition the next `GET /parsers` scan could trip on.
+    fn assert_no_tmps(dir: &std::path::Path) {
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .expect("scratch dir must be listable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind after publish: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn test_publish_pair_writes_both_then_renames() {
+        let dir = scratch_dir("happy");
+        publish_parser_pair(&dir, "fw.json", "fw.yaml", r#"{"a":1}"#, "a: 1\n")
+            .expect("fresh publish must succeed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
+            r#"{"a":1}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.yaml")).unwrap(),
+            "a: 1\n"
+        );
+        assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Crash-window proxy: block the YAML rename (a directory where the file
+    /// must go — fails even as root, unlike permission bits) and assert the
+    /// JSON half is NOT left behind with new content.
+    #[test]
+    fn test_publish_pair_failure_leaves_no_half_pair() {
+        let dir = scratch_dir("half");
+        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
+
+        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
+            .expect_err("YAML rename onto a directory must fail");
+        let _ = err;
+
+        assert!(
+            !dir.join("fw.json").exists(),
+            "failed publish must not leave the JSON half behind"
+        );
+        // The blocker itself is untouched — rollback removes files, never dirs.
+        assert!(dir.join("fw.yaml").is_dir());
+        assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same failure, but a parser was already published: the JSON target
+    /// must be rolled back to its PRIOR contents, not deleted, and the YAML
+    /// prior must be intact.
+    #[test]
+    fn test_publish_pair_failure_restores_prior() {
+        let dir = scratch_dir("rollback");
+        std::fs::write(dir.join("fw.json"), "OLD-JSON").unwrap();
+        std::fs::write(dir.join("fw.yaml"), "OLD-YAML").unwrap();
+        // Re-publish over the pair first: proves overwrite works mid-test.
+        publish_parser_pair(&dir, "fw.json", "fw.yaml", "MID-JSON", "MID-YAML").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
+            "MID-JSON"
+        );
+
+        // Now block the YAML target and re-publish: JSON rename succeeds,
+        // YAML rename fails, JSON must roll back to MID-JSON.
+        std::fs::remove_file(dir.join("fw.yaml")).unwrap();
+        std::fs::create_dir(dir.join("fw.yaml")).unwrap();
+        publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
+            .expect_err("blocked YAML rename must fail");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
+            "MID-JSON",
+            "JSON half must roll back to prior contents, not keep NEW-JSON"
+        );
+        assert!(dir.join("fw.yaml").is_dir());
+        assert_no_tmps(&dir);
+
+        // Unblock and prove the pair still publishes cleanly afterwards.
+        std::fs::remove_dir(dir.join("fw.yaml")).unwrap();
+        publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
+            "NEW-JSON"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.yaml")).unwrap(),
+            "NEW-YAML"
+        );
+        assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rollback that completes cleanly must report ONLY the publish failure.
+    ///
+    /// The half that renamed successfully no longer has a temp file, so
+    /// `remove_file` on it returns `NotFound` — which is the expected case, not
+    /// a rollback problem. Counting it made every clean rollback report itself
+    /// as incomplete, which would train operators to ignore that signal.
+    #[test]
+    fn test_publish_pair_clean_rollback_reports_only_publish_failure() {
+        let dir = scratch_dir("cleanrollback");
+        std::fs::write(dir.join("fw.json"), "OLD-JSON").unwrap();
+        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
+
+        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
+            .expect_err("blocked YAML rename must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("rollback was incomplete"),
+            "a rollback that restored cleanly must NOT claim incompleteness: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
+            "OLD-JSON",
+            "prior contents must be back"
+        );
+        assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
