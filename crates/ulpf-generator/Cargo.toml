@@ -10,3 +10,4 @@ clap = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
+libc = { workspace = true }
