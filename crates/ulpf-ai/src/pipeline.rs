@@ -555,6 +555,105 @@ impl Default for TieredPipeline {
 mod tests {
     use super::*;
 
+    /// Stale order entries must never evict a newer buffer for a reused id,
+    /// and the queue must stay bounded under onboard-then-reuse flood churn.
+    #[test]
+    fn test_buffer_order_stale_entries_never_evict_newer_buffer() {
+        // Focused case: id 1 was onboarded (stale head entry), then reused for
+        // a newer buffer whose fresh entry sits at the tail. Id 2 is a pure
+        // stale entry (onboarded, never reused). Id 3 is the true oldest live
+        // buffer with no duplicate.
+        let mut buffers: HashMap<usize, Vec<String>> = HashMap::new();
+        buffers.insert(1, vec!["new-sample-a".to_string()]);
+        buffers.insert(3, vec!["oldest-live".to_string()]);
+        let mut order: VecDeque<usize> = VecDeque::from(vec![1, 2, 3, 1]);
+
+        let evicted = pop_oldest_live_buffer(&mut buffers, &mut order);
+        assert_eq!(
+            evicted,
+            Some(3),
+            "must evict the oldest live id without a newer duplicate, not the reused id 1"
+        );
+        assert!(
+            buffers.contains_key(&1),
+            "stale head entry for reused id 1 must not discard its newer buffer"
+        );
+        assert!(
+            !buffers.contains_key(&3),
+            "oldest live buffer 3 must be the one evicted"
+        );
+    }
+
+    /// Onboard-then-reuse flood: the order queue stays bounded (compacted to
+    /// live keys, deduped) instead of growing one stale entry per onboard.
+    #[test]
+    fn test_buffer_order_stays_bounded_under_onboard_reuse_flood() {
+        let mut buffers: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut order: VecDeque<usize> = VecDeque::new();
+
+        // Fill to the cap.
+        for id in 0..MAX_CLUSTER_BUFFERS {
+            buffers.insert(id, vec![format!("sample-{id}")]);
+            order.push_back(id);
+        }
+        // Steady-state churn the way the worker sees it: each cycle onboards
+        // (removes) 100 oldest-live ids without touching the queue — leaving
+        // stale entries — then inserts 100 fresh ids (plus a few reused ids
+        // with stale+fresh duplicates). Buffers stay at the cap; only the
+        // queue grows, which is exactly the leak being fixed.
+        let mut next_id = MAX_CLUSTER_BUFFERS;
+        let mut onboard_cursor = 0;
+        while order.len() <= BUFFER_ORDER_COMPACT_LEN {
+            // Onboard-remove 100 live ids.
+            let mut removed = 0;
+            while removed < 100 && onboard_cursor < next_id {
+                if buffers.remove(&onboard_cursor).is_some() {
+                    removed += 1;
+                }
+                onboard_cursor += 1;
+            }
+            // Reuse one just-onboarded id for a newer buffer (duplicate).
+            let reused = onboard_cursor.saturating_sub(1);
+            buffers.insert(reused, vec![format!("reused-{reused}")]);
+            order.push_back(reused);
+            // Insert fresh ids to refill to the cap.
+            while buffers.len() < MAX_CLUSTER_BUFFERS {
+                buffers.insert(next_id, vec![format!("flood-{next_id}")]);
+                order.push_back(next_id);
+                next_id += 1;
+            }
+        }
+        assert!(
+            order.len() > BUFFER_ORDER_COMPACT_LEN,
+            "harness must actually exceed the compaction trigger, len={}",
+            order.len()
+        );
+        compact_buffer_order(&mut order, &buffers);
+
+        assert!(
+            order.len() <= buffers.len(),
+            "compacted queue must hold at most one entry per live buffer, queue={} buffers={}",
+            order.len(),
+            buffers.len()
+        );
+        assert!(
+            order.len() <= MAX_CLUSTER_BUFFERS,
+            "compacted queue must respect the cap, len={}",
+            order.len()
+        );
+        let mut seen = std::collections::HashSet::with_capacity(order.len());
+        for &key in order.iter() {
+            assert!(
+                buffers.contains_key(&key),
+                "compacted queue must retain only live keys, found stale {key}"
+            );
+            assert!(
+                seen.insert(key),
+                "compacted queue must not hold duplicates, found {key} twice"
+            );
+        }
+    }
+
     #[test]
     fn test_tiered_pipeline_lifecycle_and_promotion() {
         let pipeline = TieredPipeline::new();
