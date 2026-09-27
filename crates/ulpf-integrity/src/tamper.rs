@@ -383,6 +383,7 @@ pub fn verify_records(records: &[StoredLogRecord], ledger_entry: &LedgerEntry) -
     }
 }
 
+/// Truncates a raw log to a short preview for tamper reports.
 fn preview_log(log: &str) -> String {
     let max_len = 64;
     if log.chars().count() <= max_len {
@@ -398,13 +399,14 @@ mod tests {
     use super::*;
     use crate::storage::StoredLogRecord;
 
+    /// Builds `n` valid records with fresh UUIDv7 IDs for tests.
     fn make_records(n: usize) -> Vec<StoredLogRecord> {
         (0..n)
             .map(|i| {
                 let raw_log = format!("firewall-01 log line {i} src=192.168.1.{i}", i = i % 250);
                 let raw_hash = hex::encode(Sha256::digest(raw_log.as_bytes()));
                 StoredLogRecord {
-                    event_id: format!("event-{i:05}"),
+                    event_id: uuid::Uuid::now_v7().to_string(),
                     block_id: 0,
                     leaf_index: i as u32,
                     timestamp: 1_700_000_000 + i as i64,
@@ -417,6 +419,7 @@ mod tests {
             .collect()
     }
 
+    /// Builds the matching ledger entry for a set of test records.
     fn ledger_for(records: &[StoredLogRecord]) -> LedgerEntry {
         let tree = MerkleTree::from_raw_logs(records.iter().map(|r| r.raw_log.as_bytes()));
         LedgerEntry {
