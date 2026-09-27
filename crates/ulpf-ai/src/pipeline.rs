@@ -39,6 +39,55 @@ const MAX_TRIAGE_KEYS: usize = 10_000;
 /// Worker-side bound: distinct per-cluster exemplar buffers retained.
 /// Past this the oldest cluster is evicted before its samples onboard.
 const MAX_CLUSTER_BUFFERS: usize = 10_000;
+/// Compaction trigger: the worker's `buffer_order` queue holds one entry per
+/// buffer insertion but entries go stale on onboarding removal, so the queue
+/// can outgrow `buffers`. Past 2x the cap it is rebuilt from live keys only.
+const BUFFER_ORDER_COMPACT_LEN: usize = 2 * MAX_CLUSTER_BUFFERS;
+
+/// Pop the oldest live cluster buffer (FIFO). Stale entries — keys already
+/// onboarded-and-removed, or an older duplicate of a reused cluster id that
+/// still has a newer entry later in the queue — are skipped WITHOUT evicting:
+/// evicting on a stale duplicate would discard the NEWER buffer's samples.
+fn pop_oldest_live_buffer(
+    buffers: &mut HashMap<usize, Vec<String>>,
+    order: &mut VecDeque<usize>,
+) -> Option<usize> {
+    while let Some(old) = order.pop_front() {
+        if !buffers.contains_key(&old) {
+            continue;
+        }
+        // Stale duplicate: the id was onboarded, removed, then reused for a
+        // newer buffer that sits later in the queue. Evicting here would kill
+        // the newer buffer, so skip and let the fresh position decide.
+        if order.contains(&old) {
+            continue;
+        }
+        if buffers.remove(&old).is_some() {
+            return Some(old);
+        }
+    }
+    None
+}
+
+/// Rebuild the order queue from live buffers only (deduped, newest position
+/// wins). Called when the queue outgrows `BUFFER_ORDER_COMPACT_LEN` so it
+/// stays bounded over the process lifetime despite onboarding churn.
+fn compact_buffer_order(order: &mut VecDeque<usize>, buffers: &HashMap<usize, Vec<String>>) {
+    if order.len() <= BUFFER_ORDER_COMPACT_LEN {
+        return;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(buffers.len());
+    let mut kept = Vec::with_capacity(buffers.len());
+    // Newest-first pass: the first sighting of a key walking back from the
+    // tail is its freshest position, which is the one we keep.
+    for &key in order.iter().rev() {
+        if buffers.contains_key(&key) && seen.insert(key) {
+            kept.push(key);
+        }
+    }
+    kept.reverse();
+    *order = VecDeque::from(kept);
+}
 
 /// Real-time throughput and triage statistics across all 3 tiers
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -138,8 +187,9 @@ impl TieredPipeline {
                 // so the synthesizer sees real variation instead of a single line
                 // (generate_parser rejects slices shorter than 3).
                 let mut buffers: HashMap<usize, Vec<String>> = HashMap::new();
-                // Insertion order for the buffer bound below; removals on
-                // onboarding leave stale entries that the eviction loop skips.
+                // Insertion order for the buffer bound below. Entries go stale
+                // on onboarding removal; the eviction helper skips them and
+                // the queue is compacted past 2x the cap so it stays bounded.
                 let mut buffer_order: VecDeque<usize> = VecDeque::new();
 
                 while let Ok(task) = receiver.recv() {
@@ -167,14 +217,10 @@ impl TieredPipeline {
                         // oldest cluster is evicted first (its samples never
                         // onboard — counted so operators can see the loss).
                         while buffers.len() >= MAX_CLUSTER_BUFFERS {
-                            match buffer_order.pop_front() {
-                                Some(old) => {
-                                    if buffers.remove(&old).is_some() {
-                                        cluster_evictions_for_worker
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                None => break,
+                            if pop_oldest_live_buffer(&mut buffers, &mut buffer_order).is_some() {
+                                cluster_evictions_for_worker.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -217,6 +263,10 @@ impl TieredPipeline {
                     };
                     if done {
                         buffers.remove(&task.cluster_id);
+                        // Onboarding removal leaves a stale queue entry behind.
+                        // Compact past 2x the cap so the queue stays bounded
+                        // over process lifetime instead of growing per onboard.
+                        compact_buffer_order(&mut buffer_order, &buffers);
                     }
                 }
             })
