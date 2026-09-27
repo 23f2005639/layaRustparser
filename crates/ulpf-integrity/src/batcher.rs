@@ -58,9 +58,15 @@ pub struct IncomingLog {
     pub timestamp: Option<i64>,
     pub event_id: Option<String>,
     pub ocsf_json: Option<String>,
+    /// Hex-encoded SHA-256 of `raw_log`, passed through from the parser so the
+    /// batcher never re-hashes. `None` (e.g. older callers, tests) falls back
+    /// to hashing at flush time — output is byte-identical either way.
+    pub raw_hash: Option<String>,
 }
 
 impl IncomingLog {
+    /// Builds a log entry without parser-supplied extras; hash falls back to
+    /// a flush-time recompute, so this is always safe for ad-hoc callers.
     pub fn new(vendor: impl Into<String>, raw_log: impl Into<String>) -> Self {
         Self {
             vendor: vendor.into(),
@@ -68,21 +74,42 @@ impl IncomingLog {
             timestamp: None,
             event_id: None,
             ocsf_json: None,
+            raw_hash: None,
         }
     }
 
+    /// Attaches the event timestamp (epoch millis).
     pub fn with_timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
         self
     }
 
+    /// Attaches a pre-assigned event id (a UUIDv7 is minted at flush otherwise).
     pub fn with_event_id(mut self, id: impl Into<String>) -> Self {
         self.event_id = Some(id.into());
         self
     }
 
+    /// Attaches the pre-serialized OCSF payload (`"{}"` is used when absent).
     pub fn with_ocsf(mut self, ocsf: impl Into<String>) -> Self {
         self.ocsf_json = Some(ocsf.into());
+        self
+    }
+
+    /// Attaches the parser-computed SHA-256 of `raw_log` (unprefixed lowercase
+    /// hex, 64 chars / 32 bytes) so the flush path can pass it straight into
+    /// Parquet without hashing a second time.
+    ///
+    /// Trust contract: the value MUST be `SHA-256(raw_log)` for the exact
+    /// bytes in `raw_log`. The only trusted supplier is the parser ingest
+    /// path, which hashes the line once at classification time. A
+    /// valid-length-but-wrong digest would persist a `raw_hash` disagreeing
+    /// with `raw_log` (only caught later by `verify`), so debug builds
+    /// re-check the digest at flush and panic on mismatch — release builds
+    /// skip that rehash entirely. Malformed values (non-hex, wrong length)
+    /// are rejected with an error before anything is buffered or drained.
+    pub fn with_raw_hash(mut self, hash: impl Into<String>) -> Self {
+        self.raw_hash = Some(hash.into());
         self
     }
 }
@@ -105,6 +132,23 @@ pub struct BlockFlushResult {
     pub leaf_count: usize,
     pub parquet_path: PathBuf,
     pub tree: MerkleTree,
+}
+
+/// Checks a parser-supplied hash is well-formed hex decoding to 32 bytes.
+///
+/// This is deliberately format-only — no rehash of `raw_log`, so it stays
+/// cheap on the ingest path. Anything malformed is rejected here, at the
+/// input boundary, before the entry is buffered or a flush drains the batch.
+fn validate_supplied_raw_hash(hash: &str, vendor: &str) -> Result<()> {
+    let bytes = hex::decode(hash)
+        .with_context(|| format!("supplied raw_hash for vendor '{vendor}' is not valid hex"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "supplied raw_hash for vendor '{vendor}' decodes to {} bytes, expected 32 (SHA-256)",
+            bytes.len()
+        );
+    }
+    Ok(())
 }
 
 /// Dual-trigger batch accumulator.
@@ -177,9 +221,14 @@ impl BatchAccumulator {
         &self.in_memory_ledger
     }
 
-    /// Ingests an incoming log entry. Flushes immediately if the count or duration
-    /// trigger is satisfied.
+    /// Ingests an incoming log entry. A supplied `raw_hash` is format-checked
+    /// up front (hex + 32 bytes) so a bad value is rejected before it reaches
+    /// the buffer. Flushes immediately if the count or duration trigger is
+    /// satisfied.
     pub fn push(&mut self, log: IncomingLog) -> Result<Option<BlockFlushResult>> {
+        if let Some(hash) = log.raw_hash.as_deref() {
+            validate_supplied_raw_hash(hash, &log.vendor)?;
+        }
         if self.buffer.is_empty() {
             self.first_item_time = Some(Instant::now());
         }
@@ -223,9 +272,19 @@ impl BatchAccumulator {
     }
 
     /// Forces a flush of all currently accumulated logs into a Parquet block and ledger entry.
+    ///
+    /// Every supplied hash is re-validated for format before the buffer is
+    /// drained, so a malformed value fails here with the batch still intact
+    /// instead of dying mid-write in the storage conversion.
     pub fn flush(&mut self) -> Result<Option<BlockFlushResult>> {
         if self.buffer.is_empty() {
             return Ok(None);
+        }
+
+        for item in &self.buffer {
+            if let Some(hash) = item.raw_hash.as_deref() {
+                validate_supplied_raw_hash(hash, &item.vendor)?;
+            }
         }
 
         let logs = std::mem::take(&mut self.buffer);
@@ -242,7 +301,25 @@ impl BatchAccumulator {
         for (i, item) in logs.into_iter().enumerate() {
             let event_id = item.event_id.unwrap_or_else(|| Uuid::now_v7().to_string());
             let timestamp = item.timestamp.unwrap_or(now_ms);
-            let raw_hash = hex::encode(Sha256::digest(item.raw_log.as_bytes()));
+            // Hash #2 deleted: the parser already hashed these exact bytes
+            // (unprefixed hex SHA-256), so pass it through. A missing hash —
+            // older callers, ad-hoc tests — recomputes the identical digest.
+            let raw_hash = match item.raw_hash {
+                Some(supplied) => {
+                    // Trust contract (see `with_raw_hash`): the parser guarantees
+                    // this is SHA-256(raw_log). Recompute only under
+                    // debug_assertions, so our own bugs trip in dev/CI/test at
+                    // zero cost to release throughput.
+                    debug_assert_eq!(
+                        supplied,
+                        hex::encode(Sha256::digest(item.raw_log.as_bytes())),
+                        "with_raw_hash contract violated for vendor '{}': supplied digest is not SHA-256(raw_log)",
+                        item.vendor
+                    );
+                    supplied
+                }
+                None => hex::encode(Sha256::digest(item.raw_log.as_bytes())),
+            };
             let ocsf_json = item.ocsf_json.unwrap_or_else(|| "{}".to_string());
 
             stored_records.push(StoredLogRecord {

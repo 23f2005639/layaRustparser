@@ -532,3 +532,152 @@ fn test_rfc6962_consistency_proof() {
         "Consistency check must fail with invalid prev_root"
     );
 }
+
+#[test]
+fn test_batcher_passes_through_parser_raw_hash() {
+    // The whole point of issue #4: a parser-supplied digest must land in
+    // Parquet untouched — no second hash, byte-identical output.
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let storage_dir = temp_dir.path().join("parquet");
+    let ledger_path = temp_dir.path().join("ledger.jsonl");
+
+    let config = BatcherConfig {
+        max_batch_size: 1_000,
+        max_batch_duration_ms: 5_000,
+        storage_dir,
+        ledger_path: ledger_path.clone(),
+        compression: ParquetCompression::Snappy,
+    };
+
+    let logs = generate_logs(5);
+    let mut batcher = BatchAccumulator::new(config).expect("init");
+    for log in &logs {
+        // Same unprefixed hex SHA-256 the parser computes for this line.
+        let parser_hash = hex::encode(sha2::Sha256::digest(log.as_bytes()));
+        batcher
+            .push(IncomingLog::new("cisco", log.clone()).with_raw_hash(parser_hash))
+            .expect("push");
+    }
+    let flush = batcher.flush().expect("flush").expect("flushed");
+
+    let records = read_parquet_file(&flush.parquet_path).expect("read");
+    assert_eq!(records.len(), 5);
+    for (rec, log) in records.iter().zip(logs.iter()) {
+        assert_eq!(
+            rec.raw_hash,
+            hex::encode(sha2::Sha256::digest(log.as_bytes())),
+            "pass-through hash must survive flush byte-identical"
+        );
+    }
+
+    // And the passed-through block still verifies against its ledger root.
+    let report = verify_block_with_ledger(&flush.parquet_path, &ledger_path).expect("verify");
+    assert!(report.is_valid, "pass-through block must verify clean");
+}
+
+#[test]
+fn test_batcher_missing_raw_hash_falls_back_to_recompute() {
+    // Old callers construct IncomingLog without a hash (new() leaves it
+    // None): flush must hash the bytes itself, exactly as before #4.
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let storage_dir = temp_dir.path().join("parquet");
+    let ledger_path = temp_dir.path().join("ledger.jsonl");
+
+    let config = BatcherConfig {
+        max_batch_size: 1_000,
+        max_batch_duration_ms: 5_000,
+        storage_dir,
+        ledger_path: ledger_path.clone(),
+        compression: ParquetCompression::Snappy,
+    };
+
+    let logs = generate_logs(3);
+    let mut batcher = BatchAccumulator::new(config).expect("init");
+    for log in &logs {
+        batcher
+            .push(IncomingLog::new("cisco", log.clone()))
+            .expect("push");
+    }
+    let flush = batcher.flush().expect("flush").expect("flushed");
+
+    let records = read_parquet_file(&flush.parquet_path).expect("read");
+    assert_eq!(records.len(), 3);
+    for (rec, log) in records.iter().zip(logs.iter()) {
+        assert_eq!(
+            rec.raw_hash,
+            hex::encode(sha2::Sha256::digest(log.as_bytes())),
+            "None fallback must recompute the parser-identical digest"
+        );
+    }
+
+    let report = verify_block_with_ledger(&flush.parquet_path, &ledger_path).expect("verify");
+    assert!(report.is_valid, "fallback block must verify clean");
+}
+
+#[test]
+fn test_batcher_rejects_malformed_hash_with_buffer_intact() {
+    // A garbage supplied hash must fail at the door — before buffering or
+    // draining — so the batch stays recoverable and a retry just works.
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = BatcherConfig {
+        max_batch_size: 1_000,
+        max_batch_duration_ms: 5_000,
+        storage_dir: temp_dir.path().join("parquet"),
+        ledger_path: temp_dir.path().join("ledger.jsonl"),
+        compression: ParquetCompression::Snappy,
+    };
+
+    let log = generate_logs(1).pop().expect("one log");
+    let good_hash = hex::encode(sha2::Sha256::digest(log.as_bytes()));
+    let mut batcher = BatchAccumulator::new(config).expect("init");
+
+    batcher
+        .push(IncomingLog::new("cisco", log.clone()).with_raw_hash(good_hash.clone()))
+        .expect("good push");
+
+    // Non-hex and short-but-hex are both malformed; neither may drain the batch.
+    for bad in ["zz-top-not-hex!!", "deadbeef", "abc"] {
+        let err = batcher
+            .push(IncomingLog::new("cisco", log.clone()).with_raw_hash(bad))
+            .expect_err("malformed hash must be rejected");
+        assert!(
+            err.to_string().contains("raw_hash"),
+            "error should name the culprit, got: {err}"
+        );
+        assert_eq!(
+            batcher.pending_count(),
+            1,
+            "rejected push must leave the buffer untouched"
+        );
+    }
+
+    // Retry with the right digest lands fine, and the block verifies.
+    batcher
+        .push(IncomingLog::new("cisco", log.clone()).with_raw_hash(good_hash))
+        .expect("retry push");
+    assert_eq!(batcher.pending_count(), 2);
+    let flush = batcher.flush().expect("flush").expect("flushed");
+    assert_eq!(flush.leaf_count, 2);
+}
+
+#[test]
+#[should_panic(expected = "contract violated")]
+fn test_batcher_wrong_digest_trips_debug_contract() {
+    // 64 valid hex chars, but not the hash of this line: format checks pass,
+    // so only the debug trust-contract assert catches it (test builds panic).
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config = BatcherConfig {
+        max_batch_size: 1_000,
+        max_batch_duration_ms: 5_000,
+        storage_dir: temp_dir.path().join("parquet"),
+        ledger_path: temp_dir.path().join("ledger.jsonl"),
+        compression: ParquetCompression::Snappy,
+    };
+
+    let log = generate_logs(1).pop().expect("one log");
+    let mut batcher = BatchAccumulator::new(config).expect("init");
+    batcher
+        .push(IncomingLog::new("cisco", log).with_raw_hash("0".repeat(64)))
+        .expect("format-valid push");
+    let _ = batcher.flush();
+}
