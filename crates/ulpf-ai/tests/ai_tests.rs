@@ -653,6 +653,50 @@ fn test_tier3_onboards_novel_cluster_with_three_exemplars() {
     );
 }
 
+/// Tier-3 maps stay bounded under a flood of distinct novel shapes: the
+/// hot-path dispatch table and the worker exemplar buffers both evict oldest
+/// past 10k entries instead of growing without limit.
+#[test]
+fn test_tier3_maps_evict_oldest_past_cap() {
+    use ulpf_ai::pipeline::TieredPipeline;
+
+    // Oversized ring buffer so no exemplar is channel-dropped: every distinct
+    // shape must reach the worker, otherwise the buffer bound is untestable.
+    let pipeline = TieredPipeline::with_ring_buffer_capacity(1 << 15);
+    // 10_500 shapes against the 10_000 cap on both maps. The Cisco
+    // structural cues (`Built connection outside: inside:`) clear the
+    // worker's 0.85 confidence gate into a buffer; only the second token
+    // varies, so the signature hash (first-3-tokens fallback) is distinct
+    // per shape while Drain still sees one cluster (no syslog tag to split
+    // on — a per-line tag would make Drain itself go quadratic).
+    for i in 0..10_500 {
+        let line = format!("evictprobe w{i:05}x Built connection outside: inside:");
+        let _ = pipeline.process(&line);
+    }
+    assert!(
+        pipeline.triage_table_len() <= 10_000,
+        "dispatch table must stay capped, len={}",
+        pipeline.triage_table_len()
+    );
+    assert!(
+        pipeline.stats().triage_evictions > 0,
+        "flooding 10_500 distinct shapes past the 10k cap must evict"
+    );
+    // The worker drains asynchronously — poll for its buffer evictions.
+    let mut evicted = 0;
+    for _ in 0..100 {
+        evicted = pipeline.stats().cluster_evictions;
+        if evicted > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        evicted > 0,
+        "worker exemplar buffers must evict oldest past the 10k cap"
+    );
+}
+
 /// Laya fingerprint priors dominate structural priors: a line carrying another
 /// vendor's structural cues still classifies to the fingerprinted vendor.
 #[test]

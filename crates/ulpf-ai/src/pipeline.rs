@@ -1,6 +1,6 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -32,6 +32,62 @@ pub struct AsyncTriageTask {
 const MAX_EXEMPLARS_PER_CLUSTER: u8 = 8;
 /// Minimum sample count before the onboarder synthesizes a parser from a cluster.
 const ONBOARD_MIN_SAMPLES: usize = 3;
+/// Hot-path bound: distinct Tier-3 exemplar keys retained in
+/// `triage_dispatch_counts`. Past this the oldest key is evicted (its budget
+/// restarts if the shape ever returns).
+const MAX_TRIAGE_KEYS: usize = 10_000;
+/// Worker-side bound: distinct per-cluster exemplar buffers retained.
+/// Past this the oldest cluster is evicted before its samples onboard.
+const MAX_CLUSTER_BUFFERS: usize = 10_000;
+/// Compaction trigger: the worker's `buffer_order` queue holds one entry per
+/// buffer insertion but entries go stale on onboarding removal, so the queue
+/// can outgrow `buffers`. Past 2x the cap it is rebuilt from live keys only.
+const BUFFER_ORDER_COMPACT_LEN: usize = 2 * MAX_CLUSTER_BUFFERS;
+
+/// Pop the oldest live cluster buffer (FIFO). Stale entries — keys already
+/// onboarded-and-removed, or an older duplicate of a reused cluster id that
+/// still has a newer entry later in the queue — are skipped WITHOUT evicting:
+/// evicting on a stale duplicate would discard the NEWER buffer's samples.
+fn pop_oldest_live_buffer(
+    buffers: &mut HashMap<usize, Vec<String>>,
+    order: &mut VecDeque<usize>,
+) -> Option<usize> {
+    while let Some(old) = order.pop_front() {
+        if !buffers.contains_key(&old) {
+            continue;
+        }
+        // Stale duplicate: the id was onboarded, removed, then reused for a
+        // newer buffer that sits later in the queue. Evicting here would kill
+        // the newer buffer, so skip and let the fresh position decide.
+        if order.contains(&old) {
+            continue;
+        }
+        if buffers.remove(&old).is_some() {
+            return Some(old);
+        }
+    }
+    None
+}
+
+/// Rebuild the order queue from live buffers only (deduped, newest position
+/// wins). Called when the queue outgrows `BUFFER_ORDER_COMPACT_LEN` so it
+/// stays bounded over the process lifetime despite onboarding churn.
+fn compact_buffer_order(order: &mut VecDeque<usize>, buffers: &HashMap<usize, Vec<String>>) {
+    if order.len() <= BUFFER_ORDER_COMPACT_LEN {
+        return;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(buffers.len());
+    let mut kept = Vec::with_capacity(buffers.len());
+    // Newest-first pass: the first sighting of a key walking back from the
+    // tail is its freshest position, which is the one we keep.
+    for &key in order.iter().rev() {
+        if buffers.contains_key(&key) && seen.insert(key) {
+            kept.push(key);
+        }
+    }
+    kept.reverse();
+    *order = VecDeque::from(kept);
+}
 
 /// Real-time throughput and triage statistics across all 3 tiers
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -45,6 +101,12 @@ pub struct PipelineStats {
     pub laya_action_flags: u64,
     /// Wired Laya `score_threat_risk` head: scores at/above the 0.50 threshold
     pub laya_threat_flags: u64,
+    /// Worker-side exemplar buffer evictions (oldest cluster dropped past
+    /// `MAX_CLUSTER_BUFFERS` before onboarding)
+    pub cluster_evictions: u64,
+    /// Hot-path dispatch-table evictions (oldest exemplar key dropped past
+    /// `MAX_TRIAGE_KEYS`; its budget restarts on next sighting)
+    pub triage_evictions: u64,
     pub lru_hit_ratio: f64,
     pub lru_stats: LruStats,
 }
@@ -65,6 +127,14 @@ pub struct TieredPipeline {
     tier3_laya_onboarded: Arc<AtomicU64>,
     /// Exemplar dispatch budget per format key (Tier-3 needs >= 3 samples)
     triage_dispatch_counts: Mutex<HashMap<usize, u8>>,
+    /// Insertion order of dispatch keys: pops the oldest key when the table
+    /// hits `MAX_TRIAGE_KEYS`. Only touched on brand-new keys, never on the
+    /// per-event fast path for known keys.
+    triage_dispatch_order: Mutex<VecDeque<usize>>,
+    /// Hot-path dispatch-table evictions (see `PipelineStats::triage_evictions`)
+    triage_evictions: AtomicU64,
+    /// Worker-side exemplar buffer evictions, shared with the triage thread
+    cluster_evictions: Arc<AtomicU64>,
     /// Count of format keys still under their exemplar budget: the Tier-1 fast
     /// path reads this single atomic and pays ~1 ns in the steady state (all
     /// budgets closed) instead of touching the dispatch map at all.
@@ -105,6 +175,8 @@ impl TieredPipeline {
         let routes_ref = dynamic_routes.clone();
         let routes_open_ref = Arc::new(AtomicU64::new(0));
         let routes_open_for_worker = routes_open_ref.clone();
+        let cluster_evictions = Arc::new(AtomicU64::new(0));
+        let cluster_evictions_for_worker = cluster_evictions.clone();
 
         // Spawn Asynchronous Tier-3 Control Plane Worker (Out-of-Band)
         let worker_handle = thread::Builder::new()
@@ -115,6 +187,10 @@ impl TieredPipeline {
                 // so the synthesizer sees real variation instead of a single line
                 // (generate_parser rejects slices shorter than 3).
                 let mut buffers: HashMap<usize, Vec<String>> = HashMap::new();
+                // Insertion order for the buffer bound below. Entries go stale
+                // on onboarding removal; the eviction helper skips them and
+                // the queue is compacted past 2x the cap so it stays bounded.
+                let mut buffer_order: VecDeque<usize> = VecDeque::new();
 
                 while let Ok(task) = receiver.recv() {
                     // 1. Non-autoregressive vendor classification
@@ -134,6 +210,20 @@ impl TieredPipeline {
                         continue;
                     }
 
+                    if !buffers.contains_key(&task.cluster_id) {
+                        buffer_order.push_back(task.cluster_id);
+                        // Bound the accumulator: a flood of distinct novel
+                        // shapes must not grow this map without limit. The
+                        // oldest cluster is evicted first (its samples never
+                        // onboard — counted so operators can see the loss).
+                        while buffers.len() >= MAX_CLUSTER_BUFFERS {
+                            if pop_oldest_live_buffer(&mut buffers, &mut buffer_order).is_some() {
+                                cluster_evictions_for_worker.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                     let buf = buffers.entry(task.cluster_id).or_default();
                     if buf.len() < MAX_EXEMPLARS_PER_CLUSTER as usize {
                         buf.push(task.sample_log);
@@ -173,6 +263,10 @@ impl TieredPipeline {
                     };
                     if done {
                         buffers.remove(&task.cluster_id);
+                        // Onboarding removal leaves a stale queue entry behind.
+                        // Compact past 2x the cap so the queue stays bounded
+                        // over process lifetime instead of growing per onboard.
+                        compact_buffer_order(&mut buffer_order, &buffers);
                     }
                 }
             })
@@ -189,6 +283,9 @@ impl TieredPipeline {
             tier3_laya_dispatches: AtomicU64::new(0),
             tier3_laya_onboarded: onboarded_counter,
             triage_dispatch_counts: Mutex::new(HashMap::new()),
+            triage_dispatch_order: Mutex::new(VecDeque::new()),
+            triage_evictions: AtomicU64::new(0),
+            cluster_evictions,
             exemplar_budget_open: AtomicU64::new(0),
             dynamic_routes,
             dynamic_routes_open: routes_open_ref,
@@ -342,13 +439,35 @@ impl TieredPipeline {
     fn dispatch_triage_exemplar(&self, exemplar_key: usize, template: String, raw: &str) {
         let (within_budget, opened, closed) = match self.triage_dispatch_counts.lock() {
             Ok(mut counts) => {
-                let entry = counts.entry(exemplar_key).or_insert(0);
-                if *entry >= MAX_EXEMPLARS_PER_CLUSTER {
-                    (false, false, false)
+                if let Some(entry) = counts.get_mut(&exemplar_key) {
+                    if *entry >= MAX_EXEMPLARS_PER_CLUSTER {
+                        (false, false, false)
+                    } else {
+                        *entry += 1;
+                        (true, false, *entry >= MAX_EXEMPLARS_PER_CLUSTER)
+                    }
                 } else {
-                    let created = *entry == 0;
-                    *entry += 1;
-                    (true, created, *entry >= MAX_EXEMPLARS_PER_CLUSTER)
+                    // Brand-new shape: evict the oldest key past the bound so
+                    // a cardinality flood can't grow this map without limit.
+                    // An evicted key still holding budget gives it back first.
+                    if counts.len() >= MAX_TRIAGE_KEYS {
+                        if let Ok(mut order) = self.triage_dispatch_order.lock() {
+                            while let Some(old) = order.pop_front() {
+                                if let Some(removed) = counts.remove(&old) {
+                                    if removed < MAX_EXEMPLARS_PER_CLUSTER {
+                                        self.exemplar_budget_open.fetch_sub(1, Ordering::Relaxed);
+                                    }
+                                    self.triage_evictions.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    counts.insert(exemplar_key, 1);
+                    if let Ok(mut order) = self.triage_dispatch_order.lock() {
+                        order.push_back(exemplar_key);
+                    }
+                    (true, true, false)
                 }
             }
             Err(_) => (false, false, false),
@@ -405,9 +524,19 @@ impl TieredPipeline {
             tier3_laya_onboarded: laya_onboarded,
             laya_action_flags: self.laya_action_flags.load(Ordering::Relaxed),
             laya_threat_flags: self.laya_threat_flags.load(Ordering::Relaxed),
+            cluster_evictions: self.cluster_evictions.load(Ordering::Relaxed),
+            triage_evictions: self.triage_evictions.load(Ordering::Relaxed),
             lru_hit_ratio: lru_stats.hit_ratio,
             lru_stats,
         }
+    }
+
+    /// Current dispatch-table size (bounded at `MAX_TRIAGE_KEYS`)
+    pub fn triage_table_len(&self) -> usize {
+        self.triage_dispatch_counts
+            .lock()
+            .map(|counts| counts.len())
+            .unwrap_or(0)
     }
 
     /// Access the dynamic parser registry
@@ -425,6 +554,105 @@ impl Default for TieredPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stale order entries must never evict a newer buffer for a reused id,
+    /// and the queue must stay bounded under onboard-then-reuse flood churn.
+    #[test]
+    fn test_buffer_order_stale_entries_never_evict_newer_buffer() {
+        // Focused case: id 1 was onboarded (stale head entry), then reused for
+        // a newer buffer whose fresh entry sits at the tail. Id 2 is a pure
+        // stale entry (onboarded, never reused). Id 3 is the true oldest live
+        // buffer with no duplicate.
+        let mut buffers: HashMap<usize, Vec<String>> = HashMap::new();
+        buffers.insert(1, vec!["new-sample-a".to_string()]);
+        buffers.insert(3, vec!["oldest-live".to_string()]);
+        let mut order: VecDeque<usize> = VecDeque::from(vec![1, 2, 3, 1]);
+
+        let evicted = pop_oldest_live_buffer(&mut buffers, &mut order);
+        assert_eq!(
+            evicted,
+            Some(3),
+            "must evict the oldest live id without a newer duplicate, not the reused id 1"
+        );
+        assert!(
+            buffers.contains_key(&1),
+            "stale head entry for reused id 1 must not discard its newer buffer"
+        );
+        assert!(
+            !buffers.contains_key(&3),
+            "oldest live buffer 3 must be the one evicted"
+        );
+    }
+
+    /// Onboard-then-reuse flood: the order queue stays bounded (compacted to
+    /// live keys, deduped) instead of growing one stale entry per onboard.
+    #[test]
+    fn test_buffer_order_stays_bounded_under_onboard_reuse_flood() {
+        let mut buffers: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut order: VecDeque<usize> = VecDeque::new();
+
+        // Fill to the cap.
+        for id in 0..MAX_CLUSTER_BUFFERS {
+            buffers.insert(id, vec![format!("sample-{id}")]);
+            order.push_back(id);
+        }
+        // Steady-state churn the way the worker sees it: each cycle onboards
+        // (removes) 100 oldest-live ids without touching the queue — leaving
+        // stale entries — then inserts 100 fresh ids (plus a few reused ids
+        // with stale+fresh duplicates). Buffers stay at the cap; only the
+        // queue grows, which is exactly the leak being fixed.
+        let mut next_id = MAX_CLUSTER_BUFFERS;
+        let mut onboard_cursor = 0;
+        while order.len() <= BUFFER_ORDER_COMPACT_LEN {
+            // Onboard-remove 100 live ids.
+            let mut removed = 0;
+            while removed < 100 && onboard_cursor < next_id {
+                if buffers.remove(&onboard_cursor).is_some() {
+                    removed += 1;
+                }
+                onboard_cursor += 1;
+            }
+            // Reuse one just-onboarded id for a newer buffer (duplicate).
+            let reused = onboard_cursor.saturating_sub(1);
+            buffers.insert(reused, vec![format!("reused-{reused}")]);
+            order.push_back(reused);
+            // Insert fresh ids to refill to the cap.
+            while buffers.len() < MAX_CLUSTER_BUFFERS {
+                buffers.insert(next_id, vec![format!("flood-{next_id}")]);
+                order.push_back(next_id);
+                next_id += 1;
+            }
+        }
+        assert!(
+            order.len() > BUFFER_ORDER_COMPACT_LEN,
+            "harness must actually exceed the compaction trigger, len={}",
+            order.len()
+        );
+        compact_buffer_order(&mut order, &buffers);
+
+        assert!(
+            order.len() <= buffers.len(),
+            "compacted queue must hold at most one entry per live buffer, queue={} buffers={}",
+            order.len(),
+            buffers.len()
+        );
+        assert!(
+            order.len() <= MAX_CLUSTER_BUFFERS,
+            "compacted queue must respect the cap, len={}",
+            order.len()
+        );
+        let mut seen = std::collections::HashSet::with_capacity(order.len());
+        for &key in order.iter() {
+            assert!(
+                buffers.contains_key(&key),
+                "compacted queue must retain only live keys, found stale {key}"
+            );
+            assert!(
+                seen.insert(key),
+                "compacted queue must not hold duplicates, found {key} twice"
+            );
+        }
+    }
 
     #[test]
     fn test_tiered_pipeline_lifecycle_and_promotion() {
