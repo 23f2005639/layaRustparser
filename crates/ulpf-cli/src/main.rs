@@ -1,23 +1,27 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossbeam_channel::{bounded, RecvTimeoutError, TrySendError};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use ulpf_ai::drain::{AlertSeverity, DrainConfig, DrainMiner};
+use ulpf_ai::drain::{AlertSeverity, AnomalyType};
 use ulpf_ai::evaluator::{load_sidecar_gt, EvaluatorEngine, GtOverrides};
 use ulpf_ai::onboarder::{DynamicParserRegistry, Onboarder};
+use ulpf_ai::pipeline::TieredPipeline;
 use ulpf_core::ingest::socket::{create_tcp_listener, create_udp_socket};
 use ulpf_core::ingest::{BackpressurePolicy, LogQueue, MemoryQueue};
 use ulpf_core::parser::UniversalParser;
+use ulpf_core::schema::ocsf::NetworkActivity;
 use ulpf_integrity::batcher::{BatchAccumulator, BatcherConfig, IncomingLog};
 use ulpf_integrity::storage::ParquetCompression;
 use ulpf_integrity::tamper::verify_block_with_ledger;
@@ -84,6 +88,15 @@ struct InspectArgs {
     count: usize,
 }
 
+/// Default parse worker count: one thread per core. Parse is synchronous CPU
+/// work, so plain threads (not tokio tasks + spawn_blocking) at nproc keeps
+/// every core fed without oversubscribing the runtime.
+fn default_parse_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 /// Live Syslog ingest flags: where to listen, where to archive, and how the
 /// bounded queue between them behaves when producers outrun the consumer.
 #[derive(Args, Debug)]
@@ -124,6 +137,22 @@ struct IngestArgs {
     /// default blocks to preserve the lossless provenance invariant)
     #[arg(long, default_value_t = false)]
     drop_on_full: bool,
+
+    /// Parse worker threads, each owning a TieredPipeline by value
+    /// (default: one per core; a shared pipeline would reintroduce
+    /// Mutex<DrainMiner> contention across workers)
+    #[arg(long, default_value_t = default_parse_workers())]
+    parse_workers: usize,
+
+    /// Max lines a parse worker grabs per queue pop (default: auto = 8).
+    /// The grab must stay small in absolute terms: a full-batch pop lets one
+    /// worker batch-steal the whole queue per wake at low volume, so ~2 of N
+    /// workers engage, per-worker DrainMiners partition history, and small
+    /// rare-shape bursts can go surge-silent on a worker with no baseline.
+    /// A small chunk spreads shares across workers; pass an explicit value
+    /// to A/B tune mutex churn vs spread at high rates.
+    #[arg(long)]
+    pop_chunk: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -301,7 +330,52 @@ fn validate_ingest_args(args: &IngestArgs) -> Result<()> {
              zero capacity with block-on-full parks producers forever"
         );
     }
+    // Zero parse workers would start no consumer at all: the queue would
+    // fill and block-on-full producers would park forever.
+    if args.parse_workers == 0 {
+        anyhow::bail!(
+            "--parse-workers must be greater than 0 (got 0): \
+             no worker would ever drain the ingest queue"
+        );
+    }
+    // An explicit zero pop chunk would make every pop return empty and park
+    // all workers in their 1 ms idle sleep with a full queue in front of them.
+    if args.pop_chunk == Some(0) {
+        anyhow::bail!(
+            "--pop-chunk must be greater than 0 (got 0): \
+             workers would pop nothing and never drain the ingest queue"
+        );
+    }
     Ok(())
+}
+
+/// Max lines a parse worker takes per queue grab. Explicit `--pop-chunk`
+/// wins; otherwise a small fixed grab (8) so a low-volume burst splits
+/// across workers instead of one worker batch-stealing the whole queue per
+/// wake. Measured on 8 workers / 64-line burst: chunk 1000 or 125 (the old
+/// full-batch behavior and `batch/workers`) engages 1/8; chunk 16 engages
+/// 4/8; chunk 8 engages 5-8/8 and chunk 4 engages 8/8, all lossless. 8 is the
+/// middle: full spread with half the queue-mutex traffic of 4 (still
+/// negligible — one uncontended lock per 8 events). Pure for unit tests.
+fn resolve_pop_chunk(args: &IngestArgs) -> usize {
+    match args.pop_chunk {
+        Some(n) => n.max(1),
+        None => 8,
+    }
+}
+
+/// Claim a newly-seen template for alerting. The first worker to observe a
+/// novel shape owns the NewTemplate alert; later workers seeing the same
+/// template treat it as known (returns false) so one new format yields one
+/// alert instead of up to N (one per worker) with an inflated total_anomalies.
+/// Single short lock, and only on the rare NewTemplate path — never on the
+/// per-event hot path. Poisoned mutex degrades to emitting (fail-open: a
+/// duplicate alert beats a swallowed one).
+fn claim_new_template(seen: &Mutex<HashSet<String>>, template: &str) -> bool {
+    match seen.lock() {
+        Ok(mut guard) => guard.insert(template.to_string()),
+        Err(_) => true,
+    }
 }
 
 /// Run the live ingest pipeline: sockets → bounded queue → OCSF parse →
@@ -340,6 +414,23 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
             "block-on-full"
         }
     );
+    println!(
+        "  Parse Workers     : {} std threads (TieredPipeline each, ring {})",
+        args.parse_workers,
+        (10_000 / args.parse_workers).max(1),
+    );
+    println!(
+        "  Pop Chunk         : {} msgs/grab{}",
+        resolve_pop_chunk(&args),
+        match args.pop_chunk {
+            Some(_) => " (--pop-chunk)",
+            None => " (auto)",
+        },
+    );
+    println!(
+        "  Flush Channel     : depth {} (workers * batch_size * 2)",
+        (args.parse_workers * args.batch_size * 2).max(1),
+    );
     println!("  Taxonomy Standard : OCSF 1.3 (Class 4001 NetworkActivity)");
     println!("  Tamper-Evidence   : RFC 6962 Standard Merkle Tree");
     println!(
@@ -371,6 +462,27 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
     let total_parsed = Arc::new(AtomicU64::new(0));
     let total_blocks = Arc::new(AtomicU64::new(0));
     let total_anomalies = Arc::new(AtomicU64::new(0));
+
+    // Parse-worker -> flush-thread handoff: bounded crossbeam channel carrying
+    // parsed OCSF EVENTS (not IncomingLog, not batches). One writer — the
+    // flush thread — keeps block_id/leaf_index assignment and ledger appends
+    // sequential. Leaf order across workers is nondeterministic by design
+    // (interleaved sends); `verify` recomputes over stored raws order-
+    // agnostically, so integrity is unaffected.
+    let flush_capacity = (args.parse_workers * args.batch_size * 2).max(1);
+    let (flush_tx, flush_rx) = bounded::<NetworkActivity>(flush_capacity);
+    // Shed events under --drop-on-full at the flush channel are counted on
+    // the SAME drop counters the reporter prints (summed with queue drops).
+    let flush_dropped = Arc::new(AtomicU64::new(0));
+    let flush_dropped_bytes = Arc::new(AtomicU64::new(0));
+    // Flush-channel depth gauge for the reporter. A plain atomic instead of
+    // Sender::len(): the reporter must not hold a Sender clone, or the
+    // channel would never disconnect at shutdown and the flush thread would
+    // never reach its tail flush (workers inc after send, flush thread decs
+    // after recv).
+    let flush_depth = Arc::new(AtomicU64::new(0));
+    // Tells parse workers to exit once the ingest queue is drained.
+    let parse_shutdown = Arc::new(AtomicBool::new(false));
 
     // Spawn UDP Listener
     let udp_addr: SocketAddr = args.udp.parse().context("Invalid UDP address")?;
@@ -441,12 +553,23 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         }
     });
 
+    // Per-worker parsed counters: the engagement gauge for the reporter.
+    // Cumulative (parsed > 0 = engaged) — at low volume a batch-stealing
+    // worker leaves the rest at zero, which is exactly the skew this watches.
+    let worker_parsed: Vec<Arc<AtomicU64>> = (0..args.parse_workers)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+
     // Spawn Stats Reporter
     let total_ing_stats = total_ingested.clone();
     let total_parsed_stats = total_parsed.clone();
     let total_blocks_stats = total_blocks.clone();
     let total_anom_stats = total_anomalies.clone();
     let queue_stats = queue.clone();
+    let flush_depth_stats = flush_depth.clone();
+    let flush_dropped_stats = flush_dropped.clone();
+    let flush_dropped_bytes_stats = flush_dropped_bytes.clone();
+    let worker_parsed_stats = worker_parsed.clone();
 
     tokio::spawn(async move {
         let mut last_check = Instant::now();
@@ -461,6 +584,9 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
             let blocks = total_blocks_stats.load(Ordering::Relaxed);
             let anomalies = total_anom_stats.load(Ordering::Relaxed);
             let qs = queue_stats.stats();
+            let dropped = qs.dropped + flush_dropped_stats.load(Ordering::Relaxed);
+            let dropped_bytes =
+                qs.dropped_bytes + flush_dropped_bytes_stats.load(Ordering::Relaxed);
 
             let diff = current.saturating_sub(last_count);
             let eps = if elapsed > 0.0 {
@@ -468,10 +594,14 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
             } else {
                 0.0
             };
+            let engaged = worker_parsed_stats
+                .iter()
+                .filter(|c| c.load(Ordering::Relaxed) > 0)
+                .count();
 
             println!(
-                "\x1b[32m[ULPF LIVE]\x1b[0m Ingest: \x1b[1;37m{:>7.0} EPS\x1b[0m | Total: \x1b[1;37m{:>8}\x1b[0m | Normalized OCSF: \x1b[1;32m{:>8}\x1b[0m | Blocks Anchored: \x1b[1;35m{:>4}\x1b[0m | Anomalies: \x1b[1;33m{:>3}\x1b[0m | Queue: \x1b[1;37m{:>5} msgs / {:>8} bytes\x1b[0m | Dropped: \x1b[1;31m{} ({} bytes)\x1b[0m",
-                eps, current, parsed, blocks, anomalies, qs.current_len, qs.queued_bytes, qs.dropped, qs.dropped_bytes
+                "\x1b[32m[ULPF LIVE]\x1b[0m Ingest: \x1b[1;37m{:>7.0} EPS\x1b[0m | Total: \x1b[1;37m{:>8}\x1b[0m | Normalized OCSF: \x1b[1;32m{:>8}\x1b[0m | Blocks Anchored: \x1b[1;35m{:>4}\x1b[0m | Anomalies: \x1b[1;33m{:>3}\x1b[0m | Queue: \x1b[1;37m{:>5} msgs / {:>8} bytes\x1b[0m | Dropped: \x1b[1;31m{} ({} bytes)\x1b[0m | Pushed: \x1b[1;37m{}\x1b[0m Blocked: \x1b[1;37m{}\x1b[0m FlushQ: \x1b[1;37m{}/{}\x1b[0m | Workers: \x1b[1;37m{}/{}\x1b[0m",
+                eps, current, parsed, blocks, anomalies, qs.current_len, qs.queued_bytes, dropped, dropped_bytes, qs.pushed, qs.blocked, flush_depth_stats.load(Ordering::Relaxed), flush_capacity, engaged, worker_parsed_stats.len()
             );
 
             last_check = now;
@@ -479,13 +609,188 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         }
     });
 
-    // Main Processing Loop: Parsing -> OCSF Normalization -> Drain3 Anomaly Check -> Merkle Batching
-    let parser = UniversalParser::new();
-    let mut batcher = BatchAccumulator::new(batcher_config)?;
-    let mut miner = DrainMiner::new(DrainConfig::default());
+    // Dedicated flush thread: the ONLY writer to the batcher, so block_id /
+    // leaf_index assignment and ledger appends stay sequential. It also owns
+    // serde_json serialization, moving it off the parse hot path. Incoming
+    // fields move out of the owned event — zero extra copies.
+    let flush_blocks = total_blocks.clone();
+    let flush_depth_w = flush_depth.clone();
+    let flush_handle = std::thread::Builder::new()
+        .name("ulpf-flush".into())
+        .spawn(move || -> Result<()> {
+            let mut batcher = BatchAccumulator::new(batcher_config)?;
+            let report_flush = |tag: &str, flush_res: &ulpf_integrity::batcher::BlockFlushResult| {
+                flush_blocks.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    "\x1b[1;35m[MERKLE FLUSH{}]\x1b[0m Block #{} | Leaves: {} | Root: {}... | Saved: {}",
+                    tag,
+                    flush_res.block_id,
+                    flush_res.leaf_count,
+                    &flush_res.merkle_root.to_hex()[..16],
+                    flush_res.parquet_path.display()
+                );
+            };
+            loop {
+                match flush_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(event) => {
+                        flush_depth_w.fetch_sub(1, Ordering::Relaxed);
+                        let ocsf_json = serde_json::to_string(&event)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        // Move out of the owned event: vendor, raw, timestamp
+                        // and event id were already allocated by the parser.
+                        let NetworkActivity { time, metadata, .. } = event;
+                        let incoming =
+                            IncomingLog::new(metadata.product.vendor_name, metadata.raw_data)
+                                .with_timestamp(time)
+                                .with_event_id(metadata.event_id)
+                                .with_ocsf(ocsf_json);
+                        if let Some(flush_res) = batcher.push(incoming)? {
+                            report_flush("", &flush_res);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Idle with a partial batch past the duration trigger:
+                        // flush on time instead of waiting for the next push.
+                        if let Some(flush_res) = batcher.check_timeout()? {
+                            report_flush("", &flush_res);
+                        }
+                    }
+                    // Every parse worker exited: the channel is drained, so
+                    // persist the tail batch the dual triggers never reached.
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            if let Some(flush_res) = batcher.flush()? {
+                report_flush(" - SHUTDOWN", &flush_res);
+            }
+            Ok(())
+        })
+        .context("spawn flush thread")?;
+
+    // Parse workers: N plain std threads (parse is sync CPU work — no tokio
+    // tasks + spawn_blocking), each owning a TieredPipeline BY VALUE. Never
+    // Arc<TieredPipeline>: sharing would reintroduce Mutex<DrainMiner>
+    // contention across workers. Parse never performs flush work.
+    // The pop chunk is deliberately much smaller than the Merkle batch_size:
+    // a full-batch pop lets one worker batch-steal the whole queue per wake
+    // at low volume, leaving the other workers' DrainMiners with no history.
+    //
+    // RESIDUAL SURGE-DILUTION (known, not fixed here): each worker's
+    // DrainMiner partitions history per worker, so the RareClusterSurge trip
+    // still evaluates per worker — `total > rare_count_threshold * 3` with a
+    // per-worker baseline, `prev_count <= rare_count_threshold < count` on
+    // THAT worker's cluster. A globally-surging shape spread evenly over W
+    // workers needs ~W x the single-worker volume before any one worker's
+    // count crosses the threshold, so low-volume bursts can stay surge-silent
+    // (silence here means "below threshold", never "healthy"). The small pop
+    // chunk above narrows but does not close this gap. A real fix needs
+    // cross-worker accounting (route-by-template-hash or a shared counting
+    // thread) — filed as follow-up design work; deliberately NOT a per-event
+    // shared atomic/counter here, which would put a lock on the hot path.
+    let ring_capacity = (10_000 / args.parse_workers).max(1);
+    let pop_chunk = resolve_pop_chunk(&args);
+    let drop_flush = args.drop_on_full;
+    // Shared NewTemplate dedupe: each worker's DrainMiner fires NewTemplate
+    // independently, so without this one novel format yields up to N alerts.
+    // Keyed by template string (identical shapes mine identical templates);
+    // cluster ids differ per worker and must NOT be the key.
+    let emitted_templates: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let mut worker_handles = Vec::with_capacity(args.parse_workers);
+    for (worker_id, my_parsed) in worker_parsed.iter().enumerate() {
+        let queue_w = queue.clone();
+        let tx_w = flush_tx.clone();
+        let parsed_w = total_parsed.clone();
+        let anomalies_w = total_anomalies.clone();
+        let dropped_w = flush_dropped.clone();
+        let dropped_bytes_w = flush_dropped_bytes.clone();
+        let depth_w = flush_depth.clone();
+        let shutdown_w = parse_shutdown.clone();
+        let my_parsed_w = my_parsed.clone();
+        let emitted_w = emitted_templates.clone();
+        worker_handles.push(
+            std::thread::Builder::new()
+                .name(format!("ulpf-parse-{worker_id}"))
+                .spawn(move || {
+                    let pipeline = TieredPipeline::with_ring_buffer_capacity(ring_capacity);
+                    loop {
+                        let batch = queue_w.pop_batch(pop_chunk);
+                        if batch.is_empty() {
+                            if shutdown_w.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        for raw_log in batch {
+                            // Borrow the queued bytes in place: the old path
+                            // copied every line twice (to_vec, then to_string).
+                            let Ok(raw_str) = std::str::from_utf8(&raw_log) else {
+                                continue;
+                            };
+                            if raw_str.is_empty() {
+                                continue;
+                            }
+                            let (event, anomaly) = pipeline.process_live(raw_str);
+                            parsed_w.fetch_add(1, Ordering::Relaxed);
+                            my_parsed_w.fetch_add(1, Ordering::Relaxed);
+                            if let Some(alert) = anomaly {
+                                // Dedupe NewTemplate across workers: first
+                                // claimant owns the alert + the count, the rest
+                                // treat the shape as known. Surge alerts are
+                                // per-worker by design (see setup comment) and
+                                // pass through untouched.
+                                let mut emit = true;
+                                if alert.anomaly_type == AnomalyType::NewTemplate {
+                                    emit = claim_new_template(&emitted_w, &alert.template);
+                                }
+                                if emit {
+                                    anomalies_w.fetch_add(1, Ordering::Relaxed);
+                                    if alert.severity == AlertSeverity::High
+                                        || alert.severity == AlertSeverity::Critical
+                                    {
+                                        warn!(
+                                            "\x1b[1;31m[SECURITY ALERT]\x1b[0m {:?}",
+                                            alert.message
+                                        );
+                                    }
+                                }
+                            }
+                            if drop_flush {
+                                // Lossy shed at the flush channel under
+                                // --drop-on-full; blocking send is the
+                                // lossless default below.
+                                if let Err(e) = tx_w.try_send(event) {
+                                    match e {
+                                        TrySendError::Full(_) => {
+                                            dropped_w.fetch_add(1, Ordering::Relaxed);
+                                            dropped_bytes_w
+                                                .fetch_add(raw_str.len() as u64, Ordering::Relaxed);
+                                        }
+                                        // Flush thread is gone (shutdown):
+                                        // nothing left to hand to, exit.
+                                        TrySendError::Disconnected(_) => return,
+                                    }
+                                } else {
+                                    depth_w.fetch_add(1, Ordering::Relaxed);
+                                }
+                            } else if tx_w.send(event).is_err() {
+                                return;
+                            } else {
+                                depth_w.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+                .context("spawn parse worker")?,
+        );
+    }
+    // Main holds no flush sender: disconnect fires exactly when the last
+    // parse worker exits, which is the flush thread's cue for the tail flush.
+    drop(flush_tx);
 
     println!(
-        "\x1b[1;32m[+] Engine active. Listening for Syslog UDP/TCP traffic on port 5140...\x1b[0m"
+        "\x1b[1;32m[+] Engine active. {} parse workers on TieredPipeline, listening for Syslog UDP/TCP traffic on port 5140...\x1b[0m",
+        args.parse_workers
     );
 
     // P10.0 graceful shutdown: SIGINT/SIGTERM drains the channel and flushes
@@ -519,123 +824,70 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
     });
 
     {
-        // Scoped so the closure's mutable borrows of the pipeline end before
-        // the final flush below.
-        let mut process = |raw_log: String| -> Result<()> {
-            let event = parser.parse_lossless(&raw_log);
-            total_parsed.fetch_add(1, Ordering::Relaxed);
-
-            // Run through Drain3 structural clustering for anomaly detection
-            let cluster_res = miner.add_log(&raw_log);
-            if let Some(alert) = cluster_res.anomaly {
-                total_anomalies.fetch_add(1, Ordering::Relaxed);
-                if alert.severity == AlertSeverity::High
-                    || alert.severity == AlertSeverity::Critical
-                {
-                    warn!("\x1b[1;31m[SECURITY ALERT]\x1b[0m {:?}", alert.message);
-                }
-            }
-
-            let ocsf_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-            let incoming = IncomingLog::new(&event.metadata.product.vendor_name, raw_log)
-                .with_timestamp(event.time)
-                .with_event_id(event.metadata.event_id)
-                .with_ocsf(ocsf_json);
-
-            if let Some(flush_res) = batcher.push(incoming)? {
-                total_blocks.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    "\x1b[1;35m[MERKLE FLUSH]\x1b[0m Block #{} | Leaves: {} | Root: {}... | Saved: {}",
-                    flush_res.block_id,
-                    flush_res.leaf_count,
-                    &flush_res.merkle_root.to_hex()[..16],
-                    flush_res.parquet_path.display()
-                );
-            }
-            Ok(())
-        };
-
-        let batch_size = args.batch_size;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                    let batch = queue.pop_batch(batch_size);
-                    for raw_log in batch {
-                        let bytes = raw_log.to_vec();
-                        let raw_str = std::str::from_utf8(&bytes).unwrap_or("");
-                        if !raw_str.is_empty() {
-                            process(raw_str.to_string())?;
-                        }
-                    }
-                }
-                _ = shutdown.notified() => {
-                    info!("[ULPF] Shutdown signal: draining queue, flushing tail batch...");
-                    // Release any Block-policy producer parked on the full
-                    // queue before the grace drain, or the consumer below
-                    // could wait on a slot nobody will ever free.
-                    queue.close();
-                    break;
-                }
-            }
-        }
-
-        // Grace drain: packets in flight when the signal landed get up to
-        // ~500 ms to reach the queue before the final flush.
-        let grace_end = Instant::now() + Duration::from_millis(500);
-        loop {
-            let batch = queue.pop_batch(batch_size);
-            if batch.is_empty() {
-                if Instant::now() >= grace_end {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-            for raw_log in batch {
-                let bytes = raw_log.to_vec();
-                let raw_str = std::str::from_utf8(&bytes).unwrap_or("");
-                if !raw_str.is_empty() {
-                    process(raw_str.to_string())?;
-                }
-            }
-        }
+        // Wait for SIGINT/SIGTERM, then orchestrate the shutdown: grace window
+        // for in-flight socket packets, release parked Block producers, park
+        // the workers' exit flag, join parse workers (drains the queue tail),
+        // then join the flush thread (drains the channel tail + tail flush).
+        shutdown.notified().await;
+        info!("[ULPF] Shutdown signal: draining queue, flushing tail batch...");
+        // Grace drain: packets in flight when the signal landed get ~500 ms
+        // to reach the queue while workers keep consuming (same window the
+        // old single-threaded drain had).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Release any Block-policy producer parked on the full queue before
+        // the grace drain, or a consumer could wait on a slot nobody frees.
+        queue.close();
+        parse_shutdown.store(true, Ordering::Relaxed);
     }
 
-    // Final flush: persist the partial batch the dual triggers never reached.
-    if let Some(flush_res) = batcher.flush()? {
-        total_blocks.fetch_add(1, Ordering::Relaxed);
-        info!(
-            "\x1b[1;35m[MERKLE FLUSH - SHUTDOWN]\x1b[0m Block #{} | Leaves: {} | Root: {}... | Saved: {}",
-            flush_res.block_id,
-            flush_res.leaf_count,
-            &flush_res.merkle_root.to_hex()[..16],
-            flush_res.parquet_path.display()
-        );
+    for handle in worker_handles {
+        // Workers only touch the queue, pipelines and atomics — joining off
+        // the hot path at shutdown cannot deadlock the runtime.
+        handle
+            .join()
+            .expect("parse worker thread panicked during shutdown drain");
     }
+    // All senders are gone, so the flush thread has broken out of recv,
+    // persisted the tail batch, and exited: propagate a flush-side error, if
+    // any, instead of silently swallowing it.
+    flush_handle
+        .join()
+        .expect("flush thread panicked during shutdown")
+        .context("flush thread failed")?;
     // One snapshot for the whole summary line: re-reading the counters per
     // field could mix a pre-drain length with post-drain byte counts under
     // in-flight pushes. The lossless claim only holds when nothing was
     // shed — with drops, only the retained tail batch was flushed.
     let qs = queue.stats();
-    let tail_note = if qs.dropped == 0 {
+    let dropped = qs.dropped + flush_dropped.load(Ordering::Relaxed);
+    let dropped_bytes = qs.dropped_bytes + flush_dropped_bytes.load(Ordering::Relaxed);
+    let engaged = worker_parsed
+        .iter()
+        .filter(|c| c.load(Ordering::Relaxed) > 0)
+        .count();
+    let tail_note = if dropped == 0 {
         "tail batch flushed losslessly.".to_string()
     } else {
         format!(
             "tail batch flushed; {} lines ({} bytes) were shed upstream under drop-on-full.",
-            qs.dropped, qs.dropped_bytes
+            dropped, dropped_bytes
         )
     };
     println!(
-        "\n\x1b[1;32m[ULPF SHUTDOWN]\x1b[0m Ingest: {} | Parsed: {} | Blocks: {} | Anomalies: {} | Queue: {} msgs / {} bytes (peak {} bytes) | Dropped: {} ({} bytes) \u{2014} {}",
+        "\n\x1b[1;32m[ULPF SHUTDOWN]\x1b[0m Ingest: {} | Parsed: {} | Blocks: {} | Anomalies: {} | Workers: {}/{} engaged | Queue: {} msgs / {} bytes (peak {} bytes) | Pushed: {} Blocked: {} | Dropped: {} ({} bytes) \u{2014} {}",
         total_ingested.load(Ordering::Relaxed),
         total_parsed.load(Ordering::Relaxed),
         total_blocks.load(Ordering::Relaxed),
         total_anomalies.load(Ordering::Relaxed),
+        engaged,
+        worker_parsed.len(),
         qs.current_len,
         qs.queued_bytes,
         qs.high_water_bytes,
-        qs.dropped,
-        qs.dropped_bytes,
+        qs.pushed,
+        qs.blocked,
+        dropped,
+        dropped_bytes,
         tail_note,
     );
 
@@ -1420,6 +1672,8 @@ mod tests {
             reuse_port: true,
             queue_capacity,
             drop_on_full: false,
+            parse_workers: default_parse_workers(),
+            pop_chunk: None,
         }
     }
 
@@ -1435,5 +1689,90 @@ mod tests {
     fn positive_queue_capacity_is_accepted() {
         validate_ingest_args(&ingest_args_with_capacity(1)).unwrap();
         validate_ingest_args(&ingest_args_with_capacity(50_000)).unwrap();
+    }
+
+    #[test]
+    fn zero_parse_workers_is_rejected() {
+        // No consumer would ever drain the queue, so fail fast like the
+        // zero-capacity case instead of hanging on the first blocked push.
+        let mut args = ingest_args_with_capacity(50_000);
+        args.parse_workers = 0;
+        let err = validate_ingest_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--parse-workers"));
+    }
+
+    #[test]
+    fn parse_workers_default_to_available_parallelism() {
+        // The clap default must track nproc so a bare `ingest` feeds every
+        // core without oversubscribing the tokio runtime.
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        assert_eq!(default_parse_workers(), expected);
+        assert!(ingest_args_with_capacity(50_000).parse_workers >= 1);
+    }
+
+    #[test]
+    fn explicit_zero_pop_chunk_is_rejected() {
+        // A zero pop chunk would return empty batches forever: workers idle
+        // in their 1 ms sleep with a full queue in front of them.
+        let mut args = ingest_args_with_capacity(50_000);
+        args.pop_chunk = Some(0);
+        let err = validate_ingest_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--pop-chunk"));
+    }
+
+    #[test]
+    fn pop_chunk_auto_is_small_and_explicit_wins() {
+        // Auto must stay far below the Merkle batch so one wake cannot
+        // batch-steal the whole low-volume queue (measured: 1/8 workers
+        // engaged at chunk 125 vs 5-8/8 at chunk 8 on a 64-line burst);
+        // explicit wins verbatim, degenerate input still pops >= 1.
+        let mut args = ingest_args_with_capacity(50_000);
+        args.batch_size = 1000;
+        args.parse_workers = 8;
+        args.pop_chunk = None;
+        assert_eq!(resolve_pop_chunk(&args), 8);
+        args.pop_chunk = Some(1000);
+        assert_eq!(resolve_pop_chunk(&args), 1000);
+        args.pop_chunk = Some(0);
+        assert_eq!(resolve_pop_chunk(&args), 1);
+    }
+
+    #[test]
+    fn new_template_dedupe_across_workers_emits_once() {
+        // Two workers, same novel shape: each private DrainMiner fires
+        // NewTemplate independently, but the shared claim set lets exactly
+        // one through — the first claimant owns the alert + the count.
+        use ulpf_ai::drain::AnomalyType;
+
+        let seen: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        let novel = "BLURB-9-424242: frobnicate widget 12345 on quux-7 edge node";
+        let workers = 2;
+        let mut emitted = 0usize;
+        for _ in 0..workers {
+            let pipeline = TieredPipeline::with_ring_buffer_capacity(64);
+            let (_, anomaly) = pipeline.process_live(novel);
+            let alert = anomaly.expect("novel shape must fire on a fresh miner");
+            assert_eq!(alert.anomaly_type, AnomalyType::NewTemplate);
+            if claim_new_template(&seen, &alert.template) {
+                emitted += 1;
+            }
+        }
+        assert_eq!(
+            emitted, 1,
+            "same novel shape across {workers} workers must emit exactly one NewTemplate"
+        );
+
+        // A genuinely different shape still alerts (dedupe is per-template).
+        let other = TieredPipeline::with_ring_buffer_capacity(64);
+        let (_, anomaly) =
+            other.process_live("%ZYX-1-999001: completely different gizmo burst happened at noon");
+        let alert = anomaly.expect("distinct shape must fire on a fresh miner");
+        assert_eq!(alert.anomaly_type, AnomalyType::NewTemplate);
+        assert!(
+            claim_new_template(&seen, &alert.template),
+            "distinct template must not be suppressed by the earlier claim"
+        );
     }
 }
