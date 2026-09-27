@@ -860,4 +860,96 @@ mod tests {
     async fn pacing_unthrottled_sends_full_batch() {
         assert_eq!(next_batch_size(0, Instant::now(), 0, 64).await, 64);
     }
+
+    /// Fault-injection seam: scripted `MmsgTransport` so sendmmsg
+    /// transitions are covered without touching the network.
+    #[cfg(target_os = "linux")]
+    struct ScriptTransport {
+        script: std::collections::VecDeque<MmsgOutcome>,
+        send_calls: usize,
+        wait_calls: usize,
+        fallback_offsets: Vec<usize>,
+        fallback_result: (u64, u64, u64),
+        wait_ok: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ScriptTransport {
+        fn new(script: Vec<MmsgOutcome>, fallback_result: (u64, u64, u64), wait_ok: bool) -> Self {
+            Self {
+                script: script.into(),
+                send_calls: 0,
+                wait_calls: 0,
+                fallback_offsets: Vec::new(),
+                fallback_result,
+                wait_ok,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl MmsgTransport for ScriptTransport {
+        fn send_step(&mut self, _sent: usize) -> MmsgOutcome {
+            self.send_calls += 1;
+            self.script.pop_front().expect("script exhausted")
+        }
+
+        async fn wait_writable(&mut self) -> bool {
+            self.wait_calls += 1;
+            self.wait_ok
+        }
+
+        async fn fallback_from(&mut self, sent: usize) -> (u64, u64, u64) {
+            self.fallback_offsets.push(sent);
+            self.fallback_result
+        }
+    }
+
+    /// Finding 1: a partial `sendmmsg` batch followed by a hard error must
+    /// keep the pre-error successes in the returned packet count.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mmsg_partial_send_to_error_keeps_pre_error_count() {
+        let mut transport = ScriptTransport::new(
+            vec![
+                MmsgOutcome::Sent {
+                    count: 3,
+                    bytes: 300,
+                },
+                MmsgOutcome::FallbackRemainder,
+            ],
+            (2, 200, 1),
+            true,
+        );
+        let (pkts, bytes, errors) = mmsg_drive_loop(7, &mut transport).await;
+        assert_eq!(pkts, 5, "pre-error successes must be in the total");
+        assert_eq!(bytes, 500);
+        assert_eq!(errors, 1);
+        assert_eq!(transport.fallback_offsets, vec![3]);
+    }
+
+    /// Finding 2: persistent EAGAIN must gate every retry on one readiness
+    /// wait — one send attempt per EAGAIN, never a busy spin.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mmsg_persistent_eagain_waits_instead_of_spinning() {
+        let mut script = vec![MmsgOutcome::WaitWritable; 50];
+        script.push(MmsgOutcome::Sent {
+            count: 4,
+            bytes: 400,
+        });
+        let mut transport = ScriptTransport::new(script, (0, 0, 0), true);
+        let (pkts, bytes, errors) = mmsg_drive_loop(4, &mut transport).await;
+        assert_eq!((pkts, bytes, errors), (4, 400, 0));
+        assert_eq!(transport.send_calls, 51);
+        assert_eq!(transport.wait_calls, 50);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mmsg_writable_failure_counts_remainder_as_errors() {
+        let mut transport = ScriptTransport::new(vec![MmsgOutcome::WaitWritable], (0, 0, 0), false);
+        let (pkts, bytes, errors) = mmsg_drive_loop(4, &mut transport).await;
+        assert_eq!((pkts, bytes, errors), (0, 0, 4));
+    }
 }
