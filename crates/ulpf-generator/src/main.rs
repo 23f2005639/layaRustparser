@@ -347,6 +347,23 @@ async fn run_udp_worker(
     }
 }
 
+/// Connects a TCP stream with Nagle's algorithm disabled.
+///
+/// Benchmark payloads are small per-log `write_all` calls; leaving Nagle on
+/// would delay segments up to ~200ms waiting to coalesce, adding jitter to
+/// the measured ingest path that has nothing to do with parser throughput.
+/// Single call site for both the initial connect and the reconnect path so
+/// a reconnected stream can never silently lose the flag.
+async fn connect_tcp(target: SocketAddr) -> Result<TcpStream> {
+    let stream = TcpStream::connect(target)
+        .await
+        .with_context(|| format!("Failed to connect TCP to {}", target))?;
+    stream
+        .set_nodelay(true)
+        .context("Failed to set TCP_NODELAY")?;
+    Ok(stream)
+}
+
 async fn run_tcp_worker(
     worker_id: usize,
     target: SocketAddr,
@@ -356,13 +373,10 @@ async fn run_tcp_worker(
     target_rate: u64,
     batch_size: usize,
 ) {
-    let mut stream = match TcpStream::connect(target).await {
+    let mut stream = match connect_tcp(target).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "[Worker {}] Failed to connect TCP to {}: {}",
-                worker_id, target, e
-            );
+            eprintln!("[Worker {}] {:?}", worker_id, e);
             stats.errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -411,7 +425,8 @@ async fn run_tcp_worker(
                     worker_id, e
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Ok(new_stream) = TcpStream::connect(target).await {
+                // Reconnect through the same helper so TCP_NODELAY survives.
+                if let Ok(new_stream) = connect_tcp(target).await {
                     stream = new_stream;
                 }
             }
