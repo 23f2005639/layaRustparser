@@ -298,6 +298,180 @@ async fn next_batch_size(
     batch_size.min((expected as u64).saturating_sub(sent_count).max(1) as usize)
 }
 
+/// Collects the next `count` datagram payloads starting at `start_idx`,
+/// wrapping around the corpus. Shared by the `sendmmsg` fast path and the
+/// per-packet fallback so both emit identical wire bytes: 1 log = 1 datagram.
+fn collect_batch(logs: &[Vec<u8>], start_idx: usize, count: usize) -> Vec<&[u8]> {
+    let n = logs.len();
+    (0..count)
+        .map(|i| logs[(start_idx + i) % n].as_slice())
+        .collect()
+}
+
+/// Sends one batch of datagrams, returning (packets_sent, bytes_sent, errors).
+///
+/// NOTE on `--batch-size`: before this change it only bounded how many loop
+/// trips (individual `send()` syscalls) a worker did per iteration — it never
+/// coalesced syscalls. The Linux path below finally makes it a real batch:
+/// one `sendmmsg` syscall per batch. GSO (`UDP_SEGMENT`) was considered and
+/// REJECTED: it splits one buffer into fixed-size segments, but corpus lines
+/// vary in length by vendor, so GSO would need padding (changing wire bytes
+/// and breaking benchmark comparability) or fail outright. `sendmmsg` keeps
+/// 1 log = 1 datagram byte-for-byte.
+async fn send_udp_batch(socket: &UdpSocket, batch: &[&[u8]]) -> (u64, u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        send_udp_batch_sendmmsg(socket, batch).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        send_udp_batch_one_by_one(socket, batch).await
+    }
+}
+
+/// Per-packet fallback: one `send()` per datagram. Used on non-Linux and
+/// when `sendmmsg` hits a per-datagram error mid-batch.
+async fn send_udp_batch_one_by_one(socket: &UdpSocket, batch: &[&[u8]]) -> (u64, u64, u64) {
+    let mut pkts = 0u64;
+    let mut bytes = 0u64;
+    let mut errors = 0u64;
+    for payload in batch {
+        match socket.send(payload).await {
+            Ok(n) => {
+                pkts += 1;
+                bytes += n as u64;
+            }
+            Err(_) => errors += 1,
+        }
+    }
+    (pkts, bytes, errors)
+}
+
+/// Outcome of one `sendmmsg` syscall. Owns no pointers, so the async retry
+/// loop can match on it without holding raw `iovec` borrows across `.await`.
+#[cfg(target_os = "linux")]
+enum MmsgOutcome {
+    Sent(usize),
+    Empty,
+    WaitWritable,
+    Retry,
+    FallbackRemainder,
+}
+
+/// Owned `sendmmsg` scratch buffers: one iovec + one header per datagram.
+/// The raw pointers inside make the plain `Vec`s `!Send`, which would poison
+/// the worker future spawned on the multi-thread runtime. Wrapped so the
+/// single owner (this worker task) can hold them across `.await` points.
+/// Sound: the pointers target this struct's own iovec allocation and log
+/// bytes borrowed for the batch, and no other thread can ever observe them —
+/// `Send` only moves ownership, and the pointers stay valid wherever the
+/// owner runs the syscall.
+#[cfg(target_os = "linux")]
+struct MmsgBufs {
+    iovecs: Vec<libc::iovec>,
+    headers: Vec<libc::mmsghdr>,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MmsgBufs {}
+
+/// Builds the `sendmmsg` scratch buffers for a batch. Iovecs borrow the log
+/// buffers so payloads are never copied; headers are filled after the iovec
+/// allocation is complete so no reallocation can dangle their pointers.
+#[cfg(target_os = "linux")]
+fn mmsg_bufs(batch: &[&[u8]]) -> MmsgBufs {
+    let mut bufs = MmsgBufs {
+        iovecs: batch
+            .iter()
+            .map(|b| libc::iovec {
+                iov_base: b.as_ptr() as *mut libc::c_void,
+                iov_len: b.len(),
+            })
+            .collect(),
+        headers: Vec::with_capacity(batch.len()),
+    };
+    for iov in bufs.iovecs.iter_mut() {
+        let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        // Connected socket: no per-message address needed.
+        hdr.msg_hdr.msg_iov = iov;
+        hdr.msg_hdr.msg_iovlen = 1;
+        bufs.headers.push(hdr);
+    }
+    bufs
+}
+
+#[cfg(target_os = "linux")]
+fn sendmmsg_once(fd: libc::c_int, headers: &mut [libc::mmsghdr]) -> MmsgOutcome {
+    // SAFETY: caller guarantees `headers` points at live log buffers and
+    // `fd` is the worker's connected UDP socket. The borrow ends on return.
+    let ret = unsafe {
+        libc::sendmmsg(
+            fd,
+            headers.as_mut_ptr(),
+            headers.len() as libc::c_uint,
+            0,
+        )
+    };
+    if ret < 0 {
+        return match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted => MmsgOutcome::Retry,
+            std::io::ErrorKind::WouldBlock => MmsgOutcome::WaitWritable,
+            _ => MmsgOutcome::FallbackRemainder,
+        };
+    }
+    if ret == 0 {
+        return MmsgOutcome::Empty;
+    }
+    MmsgOutcome::Sent(ret as usize)
+}
+
+/// Batched send via `sendmmsg` on the tokio socket's fd. The socket stays
+/// nonblocking: EINTR retries inline, EAGAIN waits for writability, and a
+/// partial return resumes at the first unsent datagram.
+#[cfg(target_os = "linux")]
+async fn send_udp_batch_sendmmsg(socket: &UdpSocket, batch: &[&[u8]]) -> (u64, u64, u64) {
+    use std::os::unix::io::AsRawFd;
+
+    if batch.is_empty() {
+        return (0, 0, 0);
+    }
+    let fd = socket.as_raw_fd();
+    // One build per batch; partial sends resume at `sent` without rebuilding.
+    let mut bufs = mmsg_bufs(batch);
+
+    let mut sent = 0usize;
+    let mut bytes = 0u64;
+    let mut errors = 0u64;
+    while sent < batch.len() {
+        match sendmmsg_once(fd, &mut bufs.headers[sent..]) {
+            MmsgOutcome::Retry => continue,
+            MmsgOutcome::Empty => {
+                // Should not happen for datagrams; yield, don't hot-spin.
+                tokio::task::yield_now().await;
+            }
+            MmsgOutcome::WaitWritable => {
+                if socket.writable().await.is_err() {
+                    errors += (batch.len() - sent) as u64;
+                    break;
+                }
+            }
+            // e.g. EMSGSIZE for one oversize datagram aborts the whole call,
+            // so drain the rest one by one like before.
+            MmsgOutcome::FallbackRemainder => {
+                let (p, b, e) = send_udp_batch_one_by_one(socket, &batch[sent..]).await;
+                return (p, bytes + b, errors + e);
+            }
+            MmsgOutcome::Sent(n) => {
+                for hdr in &bufs.headers[sent..sent + n] {
+                    bytes += hdr.msg_len as u64;
+                }
+                sent += n;
+            }
+        }
+    }
+    (sent as u64, bytes, errors)
+}
+
 async fn run_udp_worker(
     worker_id: usize,
     target: SocketAddr,
@@ -337,27 +511,15 @@ async fn run_udp_worker(
             continue;
         }
 
-        let mut batch_bytes = 0u64;
-        let mut batch_pkts = 0u64;
-
-        for _ in 0..to_send {
-            let log_bytes = &logs[log_idx];
-            log_idx = (log_idx + 1) % num_logs;
-
-            match socket.send(log_bytes).await {
-                Ok(n) => {
-                    batch_bytes += n as u64;
-                    batch_pkts += 1;
-                }
-                Err(_) => {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
+        // One batch = one sendmmsg syscall on Linux, still 1 log = 1 datagram.
+        let batch = collect_batch(&logs, log_idx, to_send);
+        log_idx = (log_idx + to_send) % num_logs;
+        let (batch_pkts, batch_bytes, batch_errors) = send_udp_batch(&socket, &batch).await;
 
         sent_count += batch_pkts;
         stats.packets_sent.fetch_add(batch_pkts, Ordering::Relaxed);
         stats.bytes_sent.fetch_add(batch_bytes, Ordering::Relaxed);
+        stats.errors.fetch_add(batch_errors, Ordering::Relaxed);
 
         if target_rate == 0 {
             // Unthrottled yield to allow cooperative task scheduling
