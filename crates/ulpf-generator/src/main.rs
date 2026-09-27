@@ -404,14 +404,7 @@ fn mmsg_bufs(batch: &[&[u8]]) -> MmsgBufs {
 fn sendmmsg_once(fd: libc::c_int, headers: &mut [libc::mmsghdr]) -> MmsgOutcome {
     // SAFETY: caller guarantees `headers` points at live log buffers and
     // `fd` is the worker's connected UDP socket. The borrow ends on return.
-    let ret = unsafe {
-        libc::sendmmsg(
-            fd,
-            headers.as_mut_ptr(),
-            headers.len() as libc::c_uint,
-            0,
-        )
-    };
+    let ret = unsafe { libc::sendmmsg(fd, headers.as_mut_ptr(), headers.len() as libc::c_uint, 0) };
     if ret < 0 {
         return match std::io::Error::last_os_error().kind() {
             std::io::ErrorKind::Interrupted => MmsgOutcome::Retry,
@@ -505,8 +498,7 @@ async fn run_udp_worker(
     let mut sent_count = 0u64;
 
     while running.load(Ordering::Relaxed) {
-        let to_send =
-            next_batch_size(sent_count, worker_start, target_rate, batch_size).await;
+        let to_send = next_batch_size(sent_count, worker_start, target_rate, batch_size).await;
         if to_send == 0 {
             continue;
         }
@@ -571,8 +563,7 @@ async fn run_tcp_worker(
     let mut send_buf = Vec::with_capacity(batch_size * 256);
 
     while running.load(Ordering::Relaxed) {
-        let to_send =
-            next_batch_size(sent_count, worker_start, target_rate, batch_size).await;
+        let to_send = next_batch_size(sent_count, worker_start, target_rate, batch_size).await;
         if to_send == 0 {
             continue;
         }
@@ -646,7 +637,12 @@ mod tests {
         for chunk in msg.chunks_exact(64) {
             let mut w = [0u32; 64];
             for i in 0..16 {
-                w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+                w[i] = u32::from_be_bytes([
+                    chunk[4 * i],
+                    chunk[4 * i + 1],
+                    chunk[4 * i + 2],
+                    chunk[4 * i + 3],
+                ]);
             }
             for i in 16..64 {
                 let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -717,9 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_connect_sets_nodelay_initial_and_reconnect() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         // Initial connect path.
@@ -776,10 +770,7 @@ mod tests {
         let (pkts, bytes, errors) = send_udp_batch(&tx, &batch).await;
         assert_eq!(errors, 0);
         assert_eq!(pkts, batch.len() as u64);
-        assert_eq!(
-            bytes,
-            batch.iter().map(|b| b.len() as u64).sum::<u64>()
-        );
+        assert_eq!(bytes, batch.iter().map(|b| b.len() as u64).sum::<u64>());
 
         let mut got = Vec::new();
         for _ in 0..logs.len() {
