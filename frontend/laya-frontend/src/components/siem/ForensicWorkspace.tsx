@@ -87,7 +87,7 @@ export function ForensicWorkspace({ selectedAlert }: ForensicWorkspaceProps) {
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() =>
-              handleAction("Playbook Executed: Edge Firewall Drop rule dispatched to ASA/FortiGate cluster.")
+              handleAction("Playbook Executed: Edge Firewall Drop rule dispatched to Cisco/Fortinet cluster.")
             }
             className="px-3 py-2 rounded bg-[#1A1D20] text-white hover:bg-[#2E343A] font-mono text-[0.75rem] font-semibold shadow-sm inline-flex items-center gap-1.5 transition-colors cursor-pointer"
           >

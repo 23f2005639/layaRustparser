@@ -57,12 +57,12 @@ const navItems: NavItem[] = [
   },
   {
     name: "Query Explorer",
-    href: "#",
+    href: "/query-explorer",
     icon: Terminal,
     badge: "Parquet",
     badgeColor: "bg-white text-[#0284C7] border-[#CBD5E1]",
     activePath: "/query-explorer",
-    disabled: true,
+    disabled: false,
   },
   {
     name: "Crypto Vault",

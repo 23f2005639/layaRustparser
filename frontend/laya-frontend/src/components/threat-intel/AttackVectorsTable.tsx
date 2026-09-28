@@ -75,21 +75,21 @@ export function AttackVectorsTable({
                 <>
                   Ingesting Live Stream:{" "}
                   <strong className="text-[#1E293B] font-semibold">
-                    Suricata + ASA
+                    Suricata + Cisco
                   </strong>
                 </>
               ) : isMock ? (
                 <>
                   Sample Feed:{" "}
                   <strong className="text-[#1E293B] font-semibold">
-                    Suricata + ASA (Mock)
+                    Suricata + Cisco (Mock)
                   </strong>
                 </>
               ) : (
                 <>
                   Stream Offline:{" "}
                   <strong className="text-amber-800 font-semibold">
-                    Suricata + ASA (Disconnected)
+                    Suricata + Cisco (Disconnected)
                   </strong>
                 </>
               )}

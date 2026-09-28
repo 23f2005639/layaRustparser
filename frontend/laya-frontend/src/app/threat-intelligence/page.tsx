@@ -101,9 +101,6 @@ export default function ThreatIntelligencePage() {
       ? "MOCK"
       : "OFFLINE";
 
-  const vectorStatus: "MOCK" | "OFFLINE" =
-    status === "OFFLINE" ? "OFFLINE" : "MOCK";
-
   return (
     <AppShell currentSection="THREAT_INTEL" eps={metrics?.eps}>
       <div className="flex flex-col w-full gap-5">

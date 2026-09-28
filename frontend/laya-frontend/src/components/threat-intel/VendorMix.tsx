@@ -17,36 +17,36 @@ interface VendorDisplayItem {
 
 const vendorsList: VendorDisplayItem[] = [
   {
-    id: "cisco_asa",
-    name: "Cisco ASA",
+    id: "Cisco",
+    name: "Cisco",
     subtext: "Syslog Native",
     color: "#0284C7",
     defaultPct: 32.5,
   },
   {
-    id: "fortigate",
-    name: "FortiGate",
+    id: "Fortinet",
+    name: "Fortinet",
     subtext: "CEF/syslog",
     color: "#38BDF8",
     defaultPct: 28.0,
   },
   {
-    id: "paloalto",
-    name: "Palo Alto",
+    id: "Palo Alto Networks",
+    name: "Palo Alto Networks",
     subtext: "PAN-OS LEEF",
     color: "#0369A1",
     defaultPct: 21.5,
   },
   {
-    id: "pfsense",
-    name: "pfSense",
+    id: "Netgate",
+    name: "Netgate",
     subtext: "Filterlog JSON",
     color: "#64748B",
     defaultPct: 12.0,
   },
   {
-    id: "suricata",
-    name: "Suricata IDS/IPS",
+    id: "OISF",
+    name: "OISF",
     subtext: "Suricata EVE-JSON",
     color: "#94A3B8",
     defaultPct: 6.0,
@@ -89,7 +89,15 @@ export function VendorMix({ metrics }: VendorMixProps) {
         ) : (
           <div className="flex flex-col gap-4 mt-2">
           {vendorsList.map((vendor) => {
-            const rawPct = vendorMix[vendor.id];
+            const rawPct =
+              vendorMix[vendor.id] ??
+              vendorMix[vendor.name] ??
+              vendorMix[vendor.id.toLowerCase()] ??
+              (vendor.id === "Cisco" ? vendorMix["cisco_asa"] : undefined) ??
+              (vendor.id === "Fortinet" ? vendorMix["fortigate"] : undefined) ??
+              (vendor.id === "Palo Alto Networks" ? vendorMix["paloalto"] : undefined) ??
+              (vendor.id === "Netgate" ? vendorMix["pfsense"] : undefined) ??
+              (vendor.id === "OISF" ? vendorMix["suricata"] : undefined);
             const pct = typeof rawPct === "number" ? rawPct : vendor.defaultPct;
             const logCount = Math.round((pct / 100) * totalLogs);
 

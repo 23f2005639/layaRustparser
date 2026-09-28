@@ -2,7 +2,13 @@
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Search, Bell, User, RefreshCw } from "lucide-react";
-import { getApiMode, setApiMode, checkBackendReachable } from "@/lib/api";
+import {
+  getApiMode,
+  setApiMode,
+  checkBackendReachable,
+  isBackendOnline,
+  subscribeBackendStatus,
+} from "@/lib/api";
 
 interface HeaderProps {
   currentSection?: string;
@@ -14,17 +20,17 @@ export function Header({
   eps,
 }: HeaderProps) {
   const mode = useSyncExternalStore(
-    (callback) => {
-      window.addEventListener("ulpf_api_mode_change", callback);
-      return () => {
-        window.removeEventListener("ulpf_api_mode_change", callback);
-      };
-    },
+    subscribeBackendStatus,
     () => getApiMode(),
     () => "LIVE"
   );
 
-  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const backendOnline = useSyncExternalStore(
+    subscribeBackendStatus,
+    () => isBackendOnline(),
+    () => null
+  );
+
   const [timeRange, setTimeRange] = useState<"15m" | "1h" | "24h">("1h");
   const mounted = useSyncExternalStore(
     () => () => { },
@@ -42,18 +48,14 @@ export function Header({
       if (!active) return;
 
       try {
-        const ok = await checkBackendReachable();
-
-        if (!active) return;
-        setBackendOnline(ok);
+        await checkBackendReachable();
       } catch {
-        if (!active) return;
-        setBackendOnline(false);
+        // Handled in checkBackendReachable
       }
 
       if (!active) return;
 
-      timerId = setTimeout(probeLoop, 5000);
+      timerId = setTimeout(probeLoop, 3000);
     }
 
     probeLoop();

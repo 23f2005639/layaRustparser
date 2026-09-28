@@ -107,3 +107,37 @@ export interface TimeSeriesPoint {
   eps: number;
   latency_p50: number;
 }
+
+export interface AuditStep {
+  hash: string;
+  side: "Left" | "Right";
+}
+
+export interface InclusionProofResponse {
+  block_id: number;
+  leaf_index: number;
+  tree_size: number;
+  leaf_hash: string;
+  calculated_merkle_root: string;
+  ledger_merkle_root: string | null;
+  verified: boolean;
+  audit_path: AuditStep[];
+  standard: string;
+}
+
+export interface ApiErrorResponse {
+  error: string;
+  code: number;
+  message: string;
+  block_id?: number | null;
+  leaf_index?: number | null;
+}
+
+export interface RecordsQueryParams {
+  offset?: number;
+  limit?: number;
+  vendor?: string;
+  disposition?: string;
+  ip?: string;
+  query?: string;
+}

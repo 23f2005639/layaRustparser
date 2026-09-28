@@ -106,7 +106,7 @@ export function IncidentQueue({ alerts, selectedId, onSelect }: IncidentQueuePro
 
               const indicator = isCrit
                 ? "172.16.0.25 (DB Vault Node HSM)"
-                : "198.51.100.42 (Edge-Router Cisco ASA)";
+                : "198.51.100.42 (Edge-Router Cisco)";
 
               const statusText = isCrit
                 ? "Investigating - Tier 3"

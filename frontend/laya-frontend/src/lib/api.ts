@@ -4,15 +4,94 @@ import {
   StoredRecordItem,
   BlockRecordsResponse,
   BlockItem,
+  InclusionProofResponse,
+  ApiErrorResponse,
+  RecordsQueryParams,
 } from "./types";
-import { mockMetrics, mockAlerts, mockRecords } from "./mock-data";
+import {
+  mockMetrics,
+  mockAlerts,
+  mockRecords,
+  mockBlocks,
+  mockProve501,
+  mockProveLive,
+} from "./mock-data";
+
+export class ApiError extends Error {
+  status: number;
+  data?: ApiErrorResponse;
+  isOffline: boolean;
+
+  constructor(
+    message: string,
+    status: number = 0,
+    data?: ApiErrorResponse,
+    isOffline: boolean = false
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.data = data;
+    this.isOffline = isOffline;
+  }
+}
 
 const API_BASE = "http://127.0.0.1:8080";
 
 export type ApiMode = "LIVE" | "MOCK";
+export type BackendStatus = "LIVE" | "OFFLINE" | "MOCK";
 
 // Global mode state stored in memory and local storage
 let currentMode: ApiMode = "LIVE";
+let currentBackendOnline: boolean | null = null;
+const statusListeners = new Set<() => void>();
+
+function notifyStatusChange() {
+  statusListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch {
+      // ignore
+    }
+  });
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("ulpf_backend_status_change"));
+  }
+}
+
+export function setBackendOnline(online: boolean) {
+  if (currentBackendOnline !== online) {
+    currentBackendOnline = online;
+    notifyStatusChange();
+  }
+}
+
+export function isBackendOnline(): boolean | null {
+  return currentBackendOnline;
+}
+
+export function getBackendStatus(): BackendStatus {
+  const mode = getApiMode();
+  if (mode === "MOCK") return "MOCK";
+  if (currentBackendOnline === false) return "OFFLINE";
+  return "LIVE";
+}
+
+export function subscribeBackendStatus(listener: () => void): () => void {
+  statusListeners.add(listener);
+  const handleWindow = () => listener();
+  if (typeof window !== "undefined") {
+    window.addEventListener("ulpf_backend_status_change", handleWindow);
+    window.addEventListener("ulpf_api_mode_change", handleWindow);
+  }
+  return () => {
+    statusListeners.delete(listener);
+    if (typeof window !== "undefined") {
+      window.removeEventListener("ulpf_backend_status_change", handleWindow);
+      window.removeEventListener("ulpf_api_mode_change", handleWindow);
+    }
+  };
+}
 
 export function getApiMode(): ApiMode {
   if (typeof window !== "undefined") {
@@ -30,6 +109,7 @@ export function setApiMode(mode: ApiMode) {
     localStorage.setItem("ulpf_api_mode", mode);
     window.dispatchEvent(new Event("ulpf_api_mode_change"));
   }
+  notifyStatusChange();
 }
 
 /**
@@ -43,8 +123,11 @@ export async function checkBackendReachable(): Promise<boolean> {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(1500),
     });
-    return res.ok;
+    const ok = res.ok;
+    setBackendOnline(ok);
+    return ok;
   } catch {
+    setBackendOnline(false);
     return false;
   }
 }
@@ -112,17 +195,20 @@ export async function getAlerts(): Promise<{
 /**
  * Fetches stored records for a block from GET /blocks/:id/records.
  * In LIVE mode: calls backend and returns real records, or throws on failure.
- * In MOCK mode: returns fixture data.
+ * In MOCK mode: returns fixture data filtered by criteria.
  */
 export async function getBlockRecords(
   blockId: number = 1,
-  params?: {
-    offset?: number;
-    limit?: number;
-    vendor?: string;
-    disposition?: string;
-  }
-): Promise<{ data: StoredRecordItem[]; total: number; isLive: boolean }> {
+  params?: RecordsQueryParams
+): Promise<{
+  data: StoredRecordItem[];
+  total: number;
+  filteredCount: number;
+  offset: number;
+  limit: number;
+  response: BlockRecordsResponse;
+  isLive: boolean;
+}> {
   const mode = getApiMode();
 
   if (mode === "LIVE") {
@@ -131,30 +217,136 @@ export async function getBlockRecords(
     if (params?.limit !== undefined) query.set("limit", params.limit.toString());
     if (params?.vendor) query.set("vendor", params.vendor);
     if (params?.disposition) query.set("disposition", params.disposition);
+    if (params?.ip) query.set("ip", params.ip);
+    if (params?.query) query.set("query", params.query);
 
     const qs = query.toString() ? `?${query.toString()}` : "";
-    const res = await fetch(`${API_BASE}/blocks/${blockId}/records${qs}`, {
-      method: "GET",
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(3000),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/blocks/${blockId}/records${qs}`, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(5000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach investigation service.",
+        0,
+        undefined,
+        true
+      );
+    }
 
     if (!res.ok) {
-      throw new Error(`Failed to fetch block records: HTTP ${res.status}`);
+      let errorData: ApiErrorResponse | undefined;
+      try {
+        errorData = await res.json();
+      } catch {
+        // non-json response
+      }
+
+      if (res.status === 404) {
+        throw new ApiError(
+          errorData?.message || `Parquet block #${blockId} does not exist.`,
+          404,
+          errorData,
+          false
+        );
+      }
+      if (res.status === 500) {
+        throw new ApiError(
+          errorData?.message || `Failed reading Parquet block #${blockId}.`,
+          500,
+          errorData,
+          false
+        );
+      }
+      throw new ApiError(
+        errorData?.message || `Failed to fetch records: HTTP ${res.status}`,
+        res.status,
+        errorData,
+        false
+      );
     }
 
     const json: BlockRecordsResponse = await res.json();
     return {
       data: json.records,
       total: json.total_records_in_block,
+      filteredCount: json.filtered_records_count,
+      offset: json.offset,
+      limit: json.limit,
+      response: json,
       isLive: true,
     };
   }
 
+  // MOCK mode: Filter mock records according to query parameters
+  const targetBlock = mockBlocks.find((b) => b.block_id === blockId);
+  if (targetBlock && !targetBlock.file_exists) {
+    throw new ApiError(
+      `Parquet block #${blockId} does not exist.`,
+      404,
+      {
+        error: "Not Found",
+        code: 404,
+        message: `Parquet block #${blockId} does not exist on disk`,
+        block_id: blockId,
+        leaf_index: null,
+      },
+      false
+    );
+  }
+
+  const offset = params?.offset ?? 0;
+  const limit = params?.limit ?? 50;
+
+  const filtered = mockRecords.filter((r) => {
+    if (params?.vendor && r.vendor.toLowerCase() !== params.vendor.toLowerCase()) {
+      return false;
+    }
+    if (
+      params?.disposition &&
+      r.ocsf?.disposition?.toLowerCase() !== params.disposition.toLowerCase()
+    ) {
+      return false;
+    }
+    if (params?.ip) {
+      const inRaw = r.raw_log.includes(params.ip);
+      const inSrc = r.ocsf?.src_endpoint?.ip?.includes(params.ip);
+      const inDst = r.ocsf?.dst_endpoint?.ip?.includes(params.ip);
+      if (!inRaw && !inSrc && !inDst) return false;
+    }
+    if (params?.query) {
+      const q = params.query.toLowerCase();
+      const inRaw = r.raw_log.toLowerCase().includes(q);
+      const inId = r.event_id.toLowerCase().includes(q);
+      const inHash = r.raw_hash.toLowerCase().includes(q);
+      if (!inRaw && !inId && !inHash) return false;
+    }
+    return true;
+  });
+
+  const page = filtered.slice(offset, offset + limit);
+  const response: BlockRecordsResponse = {
+    block_id: blockId,
+    total_records_in_block: mockRecords.length,
+    filtered_records_count: filtered.length,
+    offset,
+    limit,
+    records: page,
+  };
+
   return {
-    data: mockRecords,
+    data: page,
     total: mockRecords.length,
+    filteredCount: filtered.length,
+    offset,
+    limit,
+    response,
     isLive: false,
   };
 }
@@ -171,15 +363,32 @@ export async function getBlocks(): Promise<{
   const mode = getApiMode();
 
   if (mode === "LIVE") {
-    const res = await fetch(`${API_BASE}/blocks`, {
-      method: "GET",
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(2000),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/blocks`, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(3000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach blocks service.",
+        0,
+        undefined,
+        true
+      );
+    }
 
     if (!res.ok) {
-      throw new Error(`Failed to fetch blocks: HTTP ${res.status}`);
+      throw new ApiError(
+        `Failed to fetch blocks: HTTP ${res.status}`,
+        res.status,
+        undefined,
+        false
+      );
     }
 
     const json: BlockItem[] = await res.json();
@@ -187,30 +396,182 @@ export async function getBlocks(): Promise<{
   }
 
   return {
-    data: [
-      {
-        block_id: 0,
-        timestamp: 1789984478063,
-        leaf_count: 1000,
-        merkle_root:
-          "e12dfacf15b6cc84fcedf91aeb3119f7d8c7a638e2c7e9541b9bb02d12833b72",
-        parquet_file: "block_00000.parquet",
-        status: "FAIL",
-        size_bytes: 345163,
-        file_exists: true,
-      },
-      {
-        block_id: 1,
-        timestamp: 1789984478081,
-        leaf_count: 1000,
-        merkle_root:
-          "398e59a6304ea9fa83b3d9eb5f0739bf081a01ce4d34e30e5c320040fd9e69a8",
-        parquet_file: "block_00001.parquet",
-        status: "PASS",
-        size_bytes: 425310,
-        file_exists: true,
-      },
-    ],
+    data: mockBlocks,
     isLive: false,
   };
+}
+
+/**
+ * Requests Merkle inclusion proof for a given block and leaf index: GET /prove/:block/:leaf
+ * Supports ?live=true for RFC 6962 audit path calculation.
+ * Preserves 501 Not Implemented semantics distinctly from network failure.
+ */
+export async function getProveInclusion(
+  blockId: number,
+  leafIndex: number,
+  live?: boolean
+): Promise<{
+  status: number;
+  data?: InclusionProofResponse;
+  error?: ApiErrorResponse;
+  isLive: boolean;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "LIVE") {
+    const url = `${API_BASE}/prove/${blockId}/${leafIndex}${live ? "?live=true" : ""}`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(4000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach proof service.",
+        0,
+        undefined,
+        true
+      );
+    }
+
+    if (res.status === 501) {
+      const errJson: ApiErrorResponse = await res.json().catch(() => ({
+        error: "Not Implemented",
+        code: 501,
+        message:
+          "Merkle inclusion proof endpoint is stubbed pending completion of #5. Pass '?live=true' to execute live computation.",
+        block_id: blockId,
+        leaf_index: leafIndex,
+      }));
+      return { status: 501, error: errJson, isLive: true };
+    }
+
+    if (!res.ok) {
+      let errJson: ApiErrorResponse | undefined;
+      try {
+        errJson = await res.json();
+      } catch {
+        // non-json
+      }
+      throw new ApiError(
+        errJson?.message || `Proof request failed with HTTP ${res.status}`,
+        res.status,
+        errJson,
+        false
+      );
+    }
+
+    const proofJson: InclusionProofResponse = await res.json();
+    return { status: 200, data: proofJson, isLive: true };
+  }
+
+  // MOCK mode
+  if (!live) {
+    return {
+      status: 501,
+      error: {
+        ...mockProve501,
+        block_id: blockId,
+        leaf_index: leafIndex,
+      },
+      isLive: false,
+    };
+  }
+
+  return {
+    status: 200,
+    data: {
+      ...mockProveLive,
+      block_id: blockId,
+      leaf_index: leafIndex,
+    },
+    isLive: false,
+  };
+}
+
+/**
+ * Downloads courtroom evidence bundle: GET /export/bundle/:id
+ * Authoritative backend artifact (.tar.gz). Never generates fake client archives.
+ */
+export async function exportEvidenceBundle(blockId: number): Promise<{
+  filename: string;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "MOCK") {
+    // Check if live backend happens to be reachable, otherwise fail honestly per integrity rules
+    const isReachable = await checkBackendReachable();
+    if (!isReachable) {
+      throw new ApiError(
+        "Authoritative courtroom evidence export requires a connected backend service. Client-side fake archive generation is prohibited.",
+        400,
+        undefined,
+        false
+      );
+    }
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/export/bundle/${blockId}`, {
+      method: "GET",
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    setBackendOnline(true);
+  } catch {
+    setBackendOnline(false);
+    throw new ApiError(
+      "Backend Offline: Unable to reach evidence export service.",
+      0,
+      undefined,
+      true
+    );
+  }
+
+  if (!res.ok) {
+    let errJson: ApiErrorResponse | undefined;
+    try {
+      errJson = await res.json();
+    } catch {
+      // non-json
+    }
+    throw new ApiError(
+      errJson?.message || `Failed to export bundle: HTTP ${res.status}`,
+      res.status,
+      errJson,
+      false
+    );
+  }
+
+  // Extract filename from Content-Disposition header if available
+  const disposition = res.headers.get("Content-Disposition");
+  let filename = `ulpf_evidence_block_${String(blockId).padStart(5, "0")}.tar.gz`;
+  if (disposition) {
+    const match = disposition.match(/filename=["']?([^"';]+)["']?/i);
+    if (match && match[1]) {
+      filename = match[1];
+    }
+  }
+
+  const blob = await res.blob();
+  if (typeof window !== "undefined") {
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      window.URL.revokeObjectURL(url);
+      a.remove();
+    }, 100);
+  }
+
+  return { filename };
 }

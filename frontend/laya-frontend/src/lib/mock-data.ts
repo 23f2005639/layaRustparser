@@ -3,6 +3,9 @@ import {
   AlertItem,
   StoredRecordItem,
   AttackVectorItem,
+  BlockItem,
+  InclusionProofResponse,
+  ApiErrorResponse,
 } from "./types";
 
 // Mirrors data/fixtures/api/metrics.json
@@ -18,6 +21,11 @@ export const mockMetrics: MetricsResponse = {
   total_parsed: 25000,
   total_blocks: 25,
   vendor_mix: {
+    Cisco: 32.5,
+    Fortinet: 28.0,
+    "Palo Alto Networks": 21.5,
+    Netgate: 12.0,
+    OISF: 6.0,
     cisco_asa: 32.5,
     fortigate: 28.0,
     paloalto: 21.5,
@@ -76,7 +84,7 @@ export const mockRecords: StoredRecordItem[] = [
     block_id: 1,
     leaf_index: 0,
     timestamp: 1789984478081,
-    vendor: "cisco_asa",
+    vendor: "Cisco",
     raw_log:
       "<166>Sep 21 14:00:01 asa-core-fw %ASA-6-302013: Built outbound TCP connection 1000672 for outside:203.0.113.54/25 to inside:10.1.6.180/52369",
     raw_hash:
@@ -118,7 +126,7 @@ export const mockRecords: StoredRecordItem[] = [
     block_id: 1,
     leaf_index: 1,
     timestamp: 1789984478082,
-    vendor: "fortigate",
+    vendor: "Fortinet",
     raw_log:
       '<189>date=2026-09-21 time=14:00:02 devname="FGT-DC-EDGE" logid="0000000019" type="traffic" srcip=192.168.7.45 srcport=29853 dstip=203.0.113.46 dstport=53 proto=17 action="deny"',
     raw_hash:
@@ -160,7 +168,7 @@ export const mockRecords: StoredRecordItem[] = [
     block_id: 1,
     leaf_index: 2,
     timestamp: 1789984478085,
-    vendor: "paloalto",
+    vendor: "Palo Alto Networks",
     raw_log:
       "1,2026/09/21 14:00:03,001801000001,TRAFFIC,drop,1,2026/09/21 14:00:03,198.51.100.99,10.0.0.15,0.0.0.0,0.0.0.0,rule-drop,test,test,web-browsing,vsys1,untrust,trust,ethernet1/1,ethernet1/2,default,2026/09/21 14:00:03,1,1,443,443,0,0,0x0,tcp,drop,40,40,0,1,2026/09/21 14:00:03,0,any,0,0,0,0,,US,10.0.0.0-10.255.255.255,0,1,0,policy-deny,0,0,0,0,,fw-core-01,from-policy",
     raw_hash:
@@ -190,7 +198,7 @@ export const mockRecords: StoredRecordItem[] = [
       },
       metadata: {
         product: {
-          vendor_name: "Palo Alto",
+          vendor_name: "Palo Alto Networks",
           name: "PAN-OS",
         },
         version: "1.3.0",
@@ -202,7 +210,7 @@ export const mockRecords: StoredRecordItem[] = [
     block_id: 1,
     leaf_index: 3,
     timestamp: 1789984478091,
-    vendor: "suricata",
+    vendor: "OISF",
     raw_log:
       '{"timestamp":"2026-09-21T14:00:04.102Z","flow_id":981273912,"event_type":"alert","src_ip":"194.26.29.114","src_port":44921,"dest_ip":"10.1.6.180","dest_port":22,"proto":"TCP","alert":{"action":"allowed","gid":1,"signature_id":2010935,"rev":2,"signature":"ET SCAN Potential SSH Brute Force","category":"Attempted Information Leak","severity":2}}',
     raw_hash:
@@ -229,7 +237,7 @@ export const mockRecords: StoredRecordItem[] = [
       },
       metadata: {
         product: {
-          vendor_name: "Suricata",
+          vendor_name: "OISF",
           name: "EVE",
         },
         version: "1.3.0",
@@ -291,3 +299,73 @@ export const mockAttackVectors: AttackVectorItem[] = [
     status: "BLOCKED",
   },
 ];
+
+// Mirrors data/fixtures/api/blocks.json
+export const mockBlocks: BlockItem[] = [
+  {
+    block_id: 0,
+    timestamp: 1789984478063,
+    leaf_count: 1000,
+    merkle_root: "e12dfacf15b6cc84fcedf91aeb3119f7d8c7a638e2c7e9541b9bb02d12833b72",
+    parquet_file: "block_00000.parquet",
+    status: "FAIL",
+    size_bytes: 345163,
+    file_exists: true,
+  },
+  {
+    block_id: 1,
+    timestamp: 1789984478081,
+    leaf_count: 1000,
+    merkle_root: "398e59a6304ea9fa83b3d9eb5f0739bf081a01ce4d34e30e5c320040fd9e69a8",
+    parquet_file: "block_00001.parquet",
+    status: "PASS",
+    size_bytes: 425310,
+    file_exists: true,
+  },
+  {
+    block_id: 2,
+    timestamp: 1789984478100,
+    leaf_count: 1000,
+    merkle_root: "e2e66d040598d535418c173721a4a6cf369f17d217e46429bd941c3bea30f1a1",
+    parquet_file: "block_00002.parquet",
+    status: "UNAUDITED",
+    size_bytes: 0,
+    file_exists: false,
+  },
+];
+
+// Mirrors data/fixtures/api/prove_501.json
+export const mockProve501: ApiErrorResponse = {
+  error: "Not Implemented",
+  code: 501,
+  message:
+    "Merkle inclusion proof endpoint is stubbed pending completion of #5 ([integrity/M] Ledger fsync + prove/consistency CLI). Pass '?live=true' to execute live RFC 6962 audit path computation.",
+  block_id: 1,
+  leaf_index: 0,
+};
+
+// Mirrors data/fixtures/api/prove_live.json
+export const mockProveLive: InclusionProofResponse = {
+  block_id: 1,
+  leaf_index: 0,
+  tree_size: 1000,
+  leaf_hash: "bf242bcb35880d5a0c9fbbb8b3df79732672c6d1fdfdfbab75c01f5981317e9e",
+  calculated_merkle_root: "398e59a6304ea9fa83b3d9eb5f0739bf081a01ce4d34e30e5c320040fd9e69a8",
+  ledger_merkle_root: "398e59a6304ea9fa83b3d9eb5f0739bf081a01ce4d34e30e5c320040fd9e69a8",
+  verified: true,
+  audit_path: [
+    {
+      hash: "b5a92d4e8c3f1a2b0c4e5d6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c",
+      side: "Right",
+    },
+    {
+      hash: "c6b03e5f9d4a2b1c0d5e6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d",
+      side: "Right",
+    },
+    {
+      hash: "d7c14f6a0e5b3c2d1e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8e",
+      side: "Right",
+    },
+  ],
+  standard: "RFC 6962 Certificate Transparency Standard",
+};
