@@ -40,12 +40,12 @@ const navItems: NavItem[] = [
   },
   {
     name: "Parsers/Norm",
-    href: "#",
+    href: "/parsers-norm",
     icon: Sliders,
     badge: "1.3",
     badgeColor: "bg-white text-[#64748B] border-[#CBD5E1]",
     activePath: "/parsers-norm",
-    disabled: true,
+    disabled: false,
   },
   {
     name: "SIEM Alerts",
@@ -66,21 +66,21 @@ const navItems: NavItem[] = [
   },
   {
     name: "Crypto Vault",
-    href: "#",
+    href: "/crypto-vault",
     icon: Lock,
     badge: "Audit",
     badgeColor: "bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30",
     activePath: "/crypto-vault",
-    disabled: true,
+    disabled: false,
   },
   {
     name: "System Health",
-    href: "#",
+    href: "/system-health",
     icon: Cpu,
     badge: "99.9%",
     badgeColor: "bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30",
     activePath: "/system-health",
-    disabled: true,
+    disabled: false,
   },
 ];
 

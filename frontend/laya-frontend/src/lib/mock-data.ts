@@ -6,6 +6,11 @@ import {
   BlockItem,
   InclusionProofResponse,
   ApiErrorResponse,
+  ParserItem,
+  ParserTestResponse,
+  OnboardResponse,
+  SystemResponse,
+  TamperDrillResponse,
 } from "./types";
 
 // Mirrors data/fixtures/api/metrics.json
@@ -369,3 +374,203 @@ export const mockProveLive: InclusionProofResponse = {
   ],
   standard: "RFC 6962 Certificate Transparency Standard",
 };
+
+// =============================================================================
+// Issue #15 Mock Fixtures
+// =============================================================================
+
+// Mirrors data/fixtures/api/parsers.json
+export const mockParsers: ParserItem[] = [
+  {
+    vendor: "cisco_asa",
+    device_model: "ASA 5500-X / Firepower",
+    parser_type: "native_extractor",
+    status: "active",
+    confidence_score: 1.0,
+  },
+  {
+    vendor: "fortigate",
+    device_model: "FortiGate NGFW (v7.0+)",
+    parser_type: "native_extractor",
+    status: "active",
+    confidence_score: 1.0,
+  },
+  {
+    vendor: "paloalto",
+    device_model: "PAN-OS (PA-Series)",
+    parser_type: "native_extractor",
+    status: "active",
+    confidence_score: 1.0,
+  },
+  {
+    vendor: "pfsense",
+    device_model: "pfSense filterlog (IPv4/IPv6)",
+    parser_type: "native_extractor",
+    status: "active",
+    confidence_score: 1.0,
+  },
+  {
+    vendor: "suricata",
+    device_model: "Suricata EVE-JSON",
+    parser_type: "native_extractor",
+    status: "active",
+    confidence_score: 1.0,
+  },
+  {
+    vendor: "cef",
+    device_model: "Common Event Format (CEF:0)",
+    parser_type: "native_extractor",
+    status: "active",
+    confidence_score: 1.0,
+  },
+];
+
+// Mirrors data/fixtures/api/parsers_test.json
+export const mockParserTest: ParserTestResponse = {
+  matched: true,
+  vendor: "cisco_asa",
+  parsed_ocsf: {
+    activity_id: 1,
+    activity_name: "Open",
+    category_uid: 4,
+    class_uid: 4001,
+    type_uid: 400101,
+    disposition: "Allowed",
+    time: 1789984478081,
+    src_endpoint: {
+      ip: "203.0.113.54",
+      port: 25,
+      interface: "outside",
+    },
+    dst_endpoint: {
+      ip: "10.1.6.180",
+      port: 52369,
+      interface: "inside",
+    },
+    connection_info: {
+      protocol_name: "TCP",
+      protocol_num: 6,
+      direction: "Outbound",
+    },
+    metadata: {
+      product: {
+        vendor_name: "Cisco",
+        name: "ASA",
+      },
+      version: "1.3.0",
+    },
+  },
+  parse_duration_micros: 2.1,
+  raw_hash: "23dfa4b126307137f68c7849cb16b9b329ad4148e6587c6778dc651f158db49f",
+  protocol_detected: "HTTP/1.1 (TCP)",
+  notes: "Parsed through dynamic registry / universal baseline (read-only)",
+};
+
+// Mirrors data/fixtures/api/onboard_preview.json
+export const mockOnboardPreview: OnboardResponse = {
+  status: "preview",
+  persisted: false,
+  vendor: "juniper_srx",
+  device_model: "srx-340",
+  parser_definition: {
+    vendor: "juniper_srx",
+    device_model: "srx-340",
+    regex_pattern:
+      "^RT_FLOW:\\s+(?P<event_type>\\S+)\\s+session\\s+(?P<action_verb>\\w+)(?:.*?)\\s+(?P<src_ip>(?:\\d{1,3}\\.){3}\\d{1,3})/(?P<src_port>\\d{1,5})->(?P<dst_ip>(?:\\d{1,3}\\.){3}\\d{1,3})/(?P<dst_port>\\d{1,5})",
+    action_mappings: {
+      created: "Allowed",
+      closed: "Allowed",
+      denied: "Blocked",
+    },
+    sample_logs: [
+      "RT_FLOW: RT_FLOW_SESSION_CREATE: session created 192.168.10.55/49152->10.0.0.1/443 None None 6 sample-policy trust untrust 12345 N/A(N/A) ge-0/0/0.0",
+    ],
+    confidence_score: 1.0,
+    created_at: 1789984500000,
+  },
+  validation_report: {
+    passed: true,
+    total_samples: 3,
+    matched_samples: 3,
+    match_percentage: 100.0,
+    errors: [],
+  },
+  message: "Parser synthesized successfully (Preview mode: confirm=false, no files written).",
+};
+
+// Mock Hot-Loaded response for MOCK mode confirmation
+export const mockOnboardHotLoaded: OnboardResponse = {
+  status: "hot_loaded",
+  persisted: true,
+  vendor: "juniper_srx",
+  device_model: "srx-340",
+  parser_definition: mockOnboardPreview.parser_definition,
+  validation_report: mockOnboardPreview.validation_report,
+  json_path: "data/parsers/juniper_srx.json",
+  yaml_path: "data/parsers/juniper_srx.yaml",
+  message: "Parser hot-loaded into active memory and written to disk.",
+};
+
+// Mirrors data/fixtures/api/system.json
+export const mockSystem: SystemResponse = {
+  service_name: "ULPF Air-Gapped Forensic Backend",
+  version: "0.1.0",
+  air_gapped: true,
+  uptime_secs: 3600,
+  batcher: {
+    max_batch_size: 1000,
+    max_batch_duration_ms: 2000,
+    storage_dir: "data/parquet",
+    ledger_path: "data/ledger.jsonl",
+    compression: "Snappy (Lossless Columnar Parquet)",
+  },
+  ingest_queue_capacity: 50000,
+  ingest_queue_depth: 0,
+  dynamic_parsers_loaded: 0,
+  total_archived_blocks: 25,
+  benchmark_summary: {
+    mode: "all",
+    throughput_speedup_factor: 1.76,
+    latency_reduction_p50_pct: 52.4,
+  },
+};
+
+// Mock Tamper Drill preview response
+export const mockTamperDrillPreview: TamperDrillResponse = {
+  status: "preview",
+  executed: false,
+  target_block_id: 1,
+  target_leaf_index: 0,
+  spoofed_ip: "10.99.99.99",
+  source_evidence_path: "data/parquet/block_00001.parquet",
+  scratch_drill_path: "data/scratch/tamper_drill_block_00001.parquet",
+  original_evidence_unmodified: true,
+  tamper_report: null,
+  message:
+    "Tamper Drill Plan: will clone evidence block to scratch directory and corrupt ONLY the copy. Pass 'confirm: true' to execute.",
+};
+
+// Mock Tamper Drill executed response
+export const mockTamperDrillSuccess: TamperDrillResponse = {
+  status: "tamper_detected",
+  executed: true,
+  target_block_id: 1,
+  target_leaf_index: 0,
+  spoofed_ip: "10.99.99.99",
+  source_evidence_path: "data/parquet/block_00001.parquet",
+  scratch_drill_path: "data/scratch/tamper_drill_block_00001.parquet",
+  original_evidence_unmodified: true,
+  tamper_report: {
+    block_id: 1,
+    is_valid: false,
+    calculated_root: "94e9f783307521dd982348572093845720394857203948572039485720394857",
+    ledger_root: "398e59a6304ea9fa83b3d9eb5f0739bf081a01ce4d34e30e5c320040fd9e69a8",
+    mismatch_leaf: 0,
+    stored_leaf_hash: "bf242bcb35880d5a0c9fbbb8b3df79732672c6d1fdfdfbab75c01f5981317e9e",
+    recalculated_leaf_hash: "82a93b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a",
+    timestamp: 1789984500000,
+  },
+  message:
+    "Tamper Drill executed on cloned scratch copy. Original evidence remained 100% untouched. Red integrity alarm generated.",
+};
+

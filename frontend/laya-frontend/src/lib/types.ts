@@ -141,3 +141,132 @@ export interface RecordsQueryParams {
   ip?: string;
   query?: string;
 }
+
+// -----------------------------------------------------------------------------
+// Issue #15: Parser & Integrity Management Types
+// -----------------------------------------------------------------------------
+
+export interface ParserItem {
+  vendor: string;
+  device_model: string;
+  parser_type: "native_extractor" | "dynamic_onboarded" | string;
+  status: "active" | "invalid" | "unreadable" | "malformed" | string;
+  source_path?: string | null;
+  regex_pattern?: string | null;
+  confidence_score?: number | null;
+  created_at?: number | null;
+}
+
+export interface ParserTestRequest {
+  raw_log: string;
+  vendor?: string;
+  regex_pattern?: string;
+  action_mappings?: Record<string, string>;
+}
+
+export interface ParserTestResponse {
+  matched: boolean;
+  vendor: string;
+  parsed_ocsf?: Record<string, unknown> | null;
+  parse_duration_micros: number;
+  raw_hash: string;
+  protocol_detected?: string | null;
+  notes: string;
+}
+
+export interface ParserDefinition {
+  vendor: string;
+  device_model: string;
+  regex_pattern: string;
+  action_mappings: Record<string, string>;
+  sample_logs?: string[];
+  confidence_score: number;
+  created_at?: number;
+}
+
+export interface ValidationReport {
+  passed: boolean;
+  total_samples: number;
+  matched_samples: number;
+  match_percentage: number;
+  errors: string[];
+}
+
+export interface OnboardRequest {
+  vendor: string;
+  device_model?: string;
+  sample_lines: string[];
+  confirm?: boolean;
+}
+
+export interface OnboardResponse {
+  status: "preview" | "hot_loaded" | string;
+  persisted: boolean;
+  vendor: string;
+  device_model: string;
+  parser_definition: ParserDefinition;
+  validation_report: ValidationReport;
+  json_path?: string | null;
+  yaml_path?: string | null;
+  message: string;
+}
+
+export interface TamperDrillRequest {
+  block_id: number;
+  leaf_index?: number;
+  spoofed_ip?: string;
+  confirm?: boolean;
+}
+
+export interface TamperReport {
+  block_id: number;
+  is_valid: boolean;
+  calculated_root: string;
+  ledger_root: string;
+  mismatch_leaf?: number | null;
+  stored_leaf_hash?: string | null;
+  recalculated_leaf_hash?: string | null;
+  timestamp: number;
+}
+
+export interface TamperDrillResponse {
+  status: "preview" | "tamper_detected" | string;
+  executed: boolean;
+  target_block_id: number;
+  target_leaf_index: number;
+  spoofed_ip: string;
+  source_evidence_path: string;
+  scratch_drill_path: string;
+  original_evidence_unmodified: boolean;
+  tamper_report?: TamperReport | null;
+  message: string;
+}
+
+export interface BatcherConfigDisplay {
+  max_batch_size: number;
+  max_batch_duration_ms: number;
+  storage_dir: string;
+  ledger_path: string;
+  compression: string;
+}
+
+export interface BenchmarkSummary {
+  mode?: string;
+  throughput_speedup_factor?: number;
+  latency_reduction_p50_pct?: number;
+  [key: string]: unknown;
+}
+
+export interface SystemResponse {
+  service_name: string;
+  version: string;
+  air_gapped: boolean;
+  uptime_secs: number;
+  batcher: BatcherConfigDisplay;
+  ingest_queue_capacity: number;
+  ingest_queue_depth: number;
+  dynamic_parsers_loaded: number;
+  total_archived_blocks: number;
+  benchmark_summary?: BenchmarkSummary | null;
+}
+
