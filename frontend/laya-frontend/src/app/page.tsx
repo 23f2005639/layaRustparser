@@ -64,8 +64,8 @@ export default function AnalystDashboardPage() {
 
     // LIVE mode: serialized poll across all endpoints
     try {
-      const [metricsRes, alertsRes, recordsRes] = await Promise.all([
-        getMetrics(),
+      const metricsRes = await getMetrics();
+      const [alertsRes, recordsRes] = await Promise.allSettled([
         getAlerts(),
         getBlockRecords(1, { limit: 10 }),
       ]);
@@ -74,9 +74,15 @@ export default function AnalystDashboardPage() {
       if (pollId !== latestPollIdRef.current) return;
 
       setMetrics(metricsRes.data);
-      setAlerts(alertsRes.data);
-      if (recordsRes.data && recordsRes.data.length > 0) {
-        setRecords(recordsRes.data);
+      if (alertsRes.status === "fulfilled") {
+        setAlerts(alertsRes.value.data);
+      }
+      if (
+        recordsRes.status === "fulfilled" &&
+        recordsRes.value.data &&
+        recordsRes.value.data.length > 0
+      ) {
+        setRecords(recordsRes.value.data);
       }
       setStatus("LIVE");
 

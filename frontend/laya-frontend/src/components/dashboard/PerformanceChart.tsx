@@ -109,7 +109,7 @@ export function PerformanceChart({
               Telemetry stream offline
             </span>
             <span className="font-mono text-[0.75rem] text-[#64748B] mt-1 text-center">
-              Backend is not responding on http://127.0.0.1:8080/metrics
+              Backend is not responding on /metrics
             </span>
           </div>
         )}

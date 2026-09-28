@@ -176,11 +176,11 @@ export function Header({
 
           <span>
             {!mounted
-              ? "OFFLINE (8080)"
+              ? "CONNECTING..."
               : mode === "LIVE"
                 ? isLiveActive
-                  ? "LIVE API (8080)"
-                  : "OFFLINE (8080)"
+                  ? "LIVE API"
+                  : "OFFLINE"
                 : "MOCK"}
           </span>
 
