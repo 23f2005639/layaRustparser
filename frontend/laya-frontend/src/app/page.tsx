@@ -8,6 +8,7 @@ import { PerformanceChart } from "@/components/dashboard/PerformanceChart";
 import { RestContractInspector } from "@/components/dashboard/RestContractInspector";
 import { AlertFeed } from "@/components/dashboard/AlertFeed";
 import { OcsfStreamTable } from "@/components/dashboard/OcsfStreamTable";
+import { TutorialOverlay } from "@/components/tutorial/TutorialOverlay";
 import { getMetrics, getAlerts, getBlockRecords, getApiMode } from "@/lib/api";
 import {
   MetricsResponse,
@@ -214,6 +215,9 @@ export default function AnalystDashboardPage() {
 
         {/* Real-Time Ingested Events Stream Table (OCSF Canonical) */}
         <OcsfStreamTable records={records} status={status} />
+
+        {/* Interactive Guided UI Tutorial */}
+        <TutorialOverlay />
       </div>
     </AppShell>
   );

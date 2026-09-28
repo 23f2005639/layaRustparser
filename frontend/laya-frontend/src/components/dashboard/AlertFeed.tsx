@@ -23,7 +23,10 @@ export function AlertFeed({ alerts, onRefresh, status = "LIVE" }: AlertFeedProps
       : alertList.filter((a) => a.severity.toLowerCase() === filterSeverity.toLowerCase());
 
   return (
-    <div className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm">
+    <div
+      data-tour="alert-feed"
+      className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm"
+    >
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#F1F5F9]">
         <div className="flex items-center gap-3">

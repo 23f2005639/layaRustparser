@@ -19,7 +19,10 @@ export function RestContractInspector({ metrics, status = "OFFLINE" }: RestContr
   };
 
   return (
-    <div className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm justify-between">
+    <div
+      data-tour="contract-inspector"
+      className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm justify-between"
+    >
       <div className="flex items-center justify-between pb-2">
         <div className="flex items-center gap-2">
           <Terminal className="w-4 h-4 text-[#0284C7]" />
