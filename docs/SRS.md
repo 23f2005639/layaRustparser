@@ -7,7 +7,7 @@ This document is the canonical requirements verdict. The short matrix in the roo
 
 - **Requirement text:** quoted verbatim from the NTRO problem statement via the
   dossier's §4 rows. Never restated.
-- **Measured results:** every number cites a committed `docs/benchmarks/eval_*_report.md`
+- **Measured results:** every number cites a committed `benchmarks/eval_*_report.md`
   §1/§1b row. Core/adversarial/full numbers are the 2026-09-28 re-measure (#46);
   the holdout report is frozen at 2026-09-24 by design and never re-run.
 - **Timing rows** follow the benchmark ritual (`AGENTS.md` Gotchas): same-run
@@ -140,7 +140,7 @@ This document is the canonical requirements verdict. The short matrix in the roo
 | **Our design** | Multi-stage Dockerfile (Rust slim-bookworm builder → debian bookworm-slim runtime, non-root `ulpf` user, healthcheck) plus compose for local bring-up. |
 | **Implementing files** | `Dockerfile`, `.dockerignore`, `docker-compose.yml` |
 | **Proving tests** | None — no test builds or sizes the image. Stated, not covered up. |
-| **Measured result** | Release binary ≈ 22.8 MB on disk, inside the 35 MB target (the published 18.6 MB badge figure is stale — issue #45). The image itself is over 35 MB (bookworm-slim + python3 + shipped docs/data). Slim-down is roadmap P10.7, tracked in #45. |
+| **Measured result** | Release binary ≈ 22.8 MB on disk, inside the 35 MB target. The image itself is over 35 MB (bookworm-slim + python3 + shipped docs/data). Slim-down is planned, tracked in #45. |
 | **Status** | partial — binary meets the target, image does not |
 
 ## Notes for judges
