@@ -1,9 +1,12 @@
 # Universal Log Pre-processing Framework (ULPF)
-## Technical Evaluation Presentation (NTRO / SIH26156) — 5 Slides
+## Technical Evaluation Presentation (NTRO) — 5 Slides
+
+> Slide → requirement map: every slide cites its SRS clause in [`SRS.md`](SRS.md). Numbers below must match the SRS verdicts; on any disagreement the SRS wins.
 
 ---
 
 ### SLIDE 1: The Challenge — Perimeter Log Chaos & The Forensic Gap
+*(SRS §3.b, §3.c, §3.f — heterogeneity · §3.d, §3.g — forensic gap)*
 
 #### The Problem
 * **Perimeter Heterogeneity:** Modern enterprise perimeters deploy firewalls, VPNs, and IDS/IPS from diverse vendors (Cisco ASA, Fortinet FortiGate, Palo Alto PAN-OS, pfSense, Suricata). Each emits logs in conflicting formats: RFC 3164 Syslog, CEF, Key-Value, CSV, and JSON.
@@ -16,6 +19,7 @@
 ---
 
 ### SLIDE 2: The Data Plane — Two-Tier Zero-Copy Ingestion & OCSF 1.3
+*(SRS §3.a — lossless · §3.b, §3.c — extract + normalize · §3.d — UUIDv7 traceability · §3.f — unified schema)*
 
 #### Architectural Workflow
 1. **Async Multi-Threaded Ingestion:** Tokio worker pool bound with `SO_REUSEPORT` on UDP/TCP ports, processing incoming packets with zero buffer copies.
@@ -28,6 +32,7 @@
 ---
 
 ### SLIDE 3: The Integrity Plane — RFC 6962 Merkle Trees & Parquet WORM
+*(SRS §3.d — traceability binding · §3.g — Parquet WORM + 186/186 verify PASS)*
 
 #### Solving the Tamper Problem
 * **RFC 6962 Standard:** Implements the Certificate Transparency cryptographic standard:
@@ -40,31 +45,42 @@
 ---
 
 ### SLIDE 4: The AI Plane — Drain3 Clustering & Air-Gapped Onboarding
+*(SRS §3.e, §3.i — onboarding · §3.h — Drain analytics · §3.j — air-gap)*
 
 #### Microsecond Structural Anomaly Detection
-* **Drain3 Template Miner (LogPai):** Runs directly on CPU in native Rust with $< 5\,\mu\text{s}$ latency per event.
+* **Drain3 Template Miner (LogPai):** Runs directly on CPU in native Rust, clustering templates in tens of microseconds with zero GPU requirements.
 * Uses a fixed-depth parse tree to extract structural patterns, masking dynamic parameters (IPs, ports, timestamps) into `<*>`.
 * **Zero-GPU Anomaly Detection:** Instantly flags unknown structural anomalies or evasion bursts without requiring heavy neural networks.
 
 #### 1-Click Plug-and-Play Onboarding
 * **Air-Gapped Operation:** No internet connection or cloud API required.
-* **Heuristic / Local SLM Synthesizer:** Analyzes 3–5 sample lines of an unknown vendor log, discovers field boundaries, synthesizes strict non-greedy regexes with named groups, and maps them to OCSF fields.
+* **New vendor live in 3 commands** — sample file → `ulpf onboard` → hot-load via `POST /onboard`. Full operator procedure: `docs/ONBOARDING_RUNBOOK.md`.
+* **Deterministic Heuristic Synthesizer:** Analyzes 3–5 sample lines of an unknown vendor log, discovers field boundaries, synthesizes strict non-greedy regexes with named groups, and maps them to OCSF fields.
 * **Automated Validation Harness:** Pre-flight tests the synthesized parser against 20 sample variations; once 100% validated, hot-loads into the running engine with zero downtime.
 
 ---
 
 ### SLIDE 5: Empirical Benchmarks & Production Readiness
+*(SRS §3 verdicts table — every row below traces to a committed `benchmarks/` report row)*
 
 | Metric / Parameter | Industry Baseline (Logstash/Fluentd) | ULPF Rust Engine | Advantage |
 | :--- | :--- | :--- | :--- |
-| **Throughput (16 vCPUs)** | 12,000 – 25,000 EPS | **> 600,000 EPS** | **25x – 50x Faster** |
-| **End-to-End Latency (P99)** | 85 – 150 ms | **< 1.8 ms** | **98% Latency Reduction** |
-| **Memory Footprint** | 1.8 GB – 3.5 GB (JVM Heap) | **< 180 MB RSS** | **90% Less Memory** |
+| **Throughput (16 vCPUs)** | 12,000 – 25,000 EPS | **1,003,273 EPS** | **40x – 80x faster** |
+| **End-to-End Latency (P99)** | 85 – 150 ms | **9.86 µs** | **>99.9% lower** |
+| **Memory Footprint** | 1.8 GB – 3.5 GB (JVM Heap) | Not measured in committed reports | — |
 | **Forensic Integrity** | Basic per-log hash (No deletion proof) | **RFC 6962 Merkle Tree ($O(\log N)$)** | **Provable Non-Repudiation** |
-| **Compression Ratio** | 45% (Gzip raw) | **> 82% (Parquet + Snappy)** | **3.8x Storage Savings** |
-| **Deployment Mode** | Cloud-dependent dependencies | **100% Air-Gapped Docker (< 40MB)** | **Zero External Network Calls** |
+| **Compression Ratio** | 45% (Gzip raw) | **4,312× template compression (32 templates from 224,657 lines)** | **Measured (eval_full_report.md)** |
+| **Deployment Mode** | Cloud-dependent dependencies | **100% Air-Gapped Docker** (image slim-down in progress — SRS §3.k: partial) | **Zero External Network Calls** |
 
-#### SIH Deliverables Checklist:
+#### Judge Q&A — "What happens at a 500k EPS burst?"
+
+One socket holds 50k EPS loss-free (measured). Past that UDP drops in
+the kernel, TCP backpressures the sender with zero loss, and the queue
+sheds only under opt-in `--drop-on-full` — every path counted on the
+live reporter. 500k on one socket was not reached; the run log and the
+repro recipe are [`INGEST_LIMITS.md`](INGEST_LIMITS.md).
+
+#### Deliverables Checklist:
 * [x] **Source Code:** Complete modular Rust workspace with zero compiler warnings.
 * [x] **Setup Documentation:** `README.md` with 1-command Docker and local setup.
 * [x] **Architecture Document:** subsystem-by-subsystem improvement walkthrough in `docs/ARCHITECTURE_FINAL.md`.

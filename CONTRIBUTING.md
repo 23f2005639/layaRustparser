@@ -1,6 +1,6 @@
 # Contributing to ULPF
 
-6-person SIH team workflow. Read `AGENTS.md` (invariants + gotchas) and `remainingStuff.md` (who owns what) first.
+Team workflow. Read `AGENTS.md` (invariants + gotchas) first, then pick unclaimed work from the [GitHub issue tracker](https://github.com/guptchar/layaRustparser/issues).
 
 ## How work flows (read this before anything else)
 
@@ -29,11 +29,11 @@ Run everything from the repo root: CLI defaults assume `data/raw`, `data/parquet
 
 ## Branches
 
-- Short-lived `feat/<topic>` or `fix/<topic>` branches, PR to `main`. No direct pushes to `main`.
-- One owner per area (see `remainingStuff.md` §8). Don't touch another owner's hot path without asking.
+- Short-lived `feat/<topic>` or `fix/<topic>` branches, PR to `master`. No direct pushes to `master`.
+- One owner per area (see open issues by `area/*` label). Don't touch another owner's hot path without asking.
 - PRs need: green CI, `cargo fmt` clean, tests for new behavior (RED → GREEN → REFACTOR).
 
-## Verification gate (run in this order, no CI will save you locally)
+## Verification gate (run in this order — CI mirrors this gate; CI is authoritative for mergeability)
 
 ```bash
 cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -A clippy::field_reassign_with_default -D warnings
@@ -45,7 +45,7 @@ Performance gates when touching parse/miner/pipeline: p50 < 5.0 µs, LRU hit rat
 Action Inviolability 100%, Grouping Accuracy > 90%. Check with:
 
 ```bash
-./target/release/ulpf evaluate --engine all --duration 3 --threads 16 --samples 10000 --out eval_hardcore_report.md
+./target/release/ulpf evaluate --engine all --duration 3 --threads 16 --samples 10000 --out docs/benchmarks/eval_hardcore_report.md
 ```
 
 ## Gotchas that have bitten us (see `AGENTS.md` for the full list)

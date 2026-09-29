@@ -1,3 +1,9 @@
+# SUPERSEDED — numbers in this file were never reproduced. Do not cite.
+
+> This is an archived pre-build document. Its headline figures (2,717,398 EPS, 8,154,686 events in 3.00s, 169,837 EPS per thread, < 1.8 µs latency) were never reproduced by any committed measurement. The fresh numbers: **1,003,273 EPS tiered (1.01× vs baseline) at p50 6.15 µs on the 224,657-line corpus** — source `eval_full_report.md` (2026-09-28); core and adversarial rows in `eval_hardcore_report.md` and `eval_adversarial_report.md` (2026-09-28). Reproduce: `./target/release/ulpf evaluate --engine all --duration 3 --threads 16 --samples 10000 --out report.md` (release build, idle machine; method: `scripts/bench.sh`). This file is kept for the research trail and will not be updated.
+>
+> ---
+>
 # Universal Log Pre-processing Framework (ULPF)
 ## Comprehensive Technical Evaluation & Defense Dossier
 **Theme:** Blockchain & Cybersecurity (SIH26156)  
@@ -63,6 +69,12 @@ During empirical benchmarking on an Intel Core i5-12500H laptop (12 cores, 16 th
 ---
 
 ## 4. SIH26156 Requirements Compliance Audit (Is It Covering All?)
+
+> **SUPERSEDED.** This table's verdicts (in particular row **(k)**, marked covered
+> here) are replaced by the canonical traceability in [`../SRS.md`](../SRS.md),
+> which keeps the verdicts, corrects (k) to **partial**, and cites committed
+> `docs/benchmarks/` report rows per requirement. The text below is preserved
+> as history — do not cite it for current status.
 
 The Smart India Hackathon problem statement for the Universal Log Pre-processing Framework (SIH26156 / NTRO) outlines **11 specific expected capabilities** (items `a` through `k`).
 

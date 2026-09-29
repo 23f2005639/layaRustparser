@@ -7,6 +7,14 @@ import {
   InclusionProofResponse,
   ApiErrorResponse,
   RecordsQueryParams,
+  ParserItem,
+  ParserTestRequest,
+  ParserTestResponse,
+  OnboardRequest,
+  OnboardResponse,
+  TamperDrillRequest,
+  TamperDrillResponse,
+  SystemResponse,
 } from "./types";
 import {
   mockMetrics,
@@ -15,6 +23,13 @@ import {
   mockBlocks,
   mockProve501,
   mockProveLive,
+  mockParsers,
+  mockParserTest,
+  mockOnboardPreview,
+  mockOnboardHotLoaded,
+  mockSystem,
+  mockTamperDrillPreview,
+  mockTamperDrillSuccess,
 } from "./mock-data";
 
 export class ApiError extends Error {
@@ -580,3 +595,359 @@ export async function exportEvidenceBundle(blockId: number): Promise<{
 
   return { filename };
 }
+
+// =============================================================================
+// Issue #15: Parser & Integrity Management API Functions
+// =============================================================================
+
+/**
+ * Fetches registered parsers list: GET /parsers
+ * Returns active native extractors and dynamic onboarded parsers.
+ */
+export async function getParsers(): Promise<{
+  data: ParserItem[];
+  isLive: boolean;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "LIVE") {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/parsers`, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(3000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach parser registry service.",
+        0,
+        undefined,
+        true
+      );
+    }
+
+    if (!res.ok) {
+      let errJson: ApiErrorResponse | undefined;
+      try {
+        errJson = await res.json();
+      } catch {
+        // non-json
+      }
+      throw new ApiError(
+        errJson?.message || `Failed to fetch parsers: HTTP ${res.status}`,
+        res.status,
+        errJson,
+        false
+      );
+    }
+
+    const json: ParserItem[] = await res.json();
+    return { data: json, isLive: true };
+  }
+
+  // MOCK mode: authoritative mock fixture replacement
+  return {
+    data: mockParsers,
+    isLive: false,
+  };
+}
+
+/**
+ * Executes a dry-run test of a raw log line against a parser: POST /parsers/test
+ * Never writes to disk or persists.
+ */
+export async function testParser(
+  payload: ParserTestRequest
+): Promise<{
+  data: ParserTestResponse;
+  isLive: boolean;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "LIVE") {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/parsers/test`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(4000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach parser test service.",
+        0,
+        undefined,
+        true
+      );
+    }
+
+    if (!res.ok) {
+      let errJson: ApiErrorResponse | undefined;
+      try {
+        errJson = await res.json();
+      } catch {
+        // non-json
+      }
+      throw new ApiError(
+        errJson?.message || `Parser test failed: HTTP ${res.status}`,
+        res.status,
+        errJson,
+        false
+      );
+    }
+
+    const json: ParserTestResponse = await res.json();
+    return { data: json, isLive: true };
+  }
+
+  // MOCK mode: returns mockParserTest fixture, reflecting vendor if provided
+  const matched = !payload.raw_log.toLowerCase().includes("unmatched");
+  return {
+    data: {
+      ...mockParserTest,
+      matched,
+      vendor: payload.vendor || mockParserTest.vendor,
+      notes: "Parsed through dynamic registry / universal baseline (read-only mock simulation)",
+    },
+    isLive: false,
+  };
+}
+
+/**
+ * Synthesizes a new regex parser definition: POST /onboard
+ * If confirm is false: returns preview synthesis without writing files.
+ * If confirm is true: writes .json & .yaml to data/parsers/ and hot-loads into active memory.
+ */
+export async function onboardParser(
+  payload: OnboardRequest
+): Promise<{
+  data: OnboardResponse;
+  isLive: boolean;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "LIVE") {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/onboard`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(5000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach onboarding service.",
+        0,
+        undefined,
+        true
+      );
+    }
+
+    if (!res.ok) {
+      let errJson: ApiErrorResponse | undefined;
+      try {
+        errJson = await res.json();
+      } catch {
+        // non-json
+      }
+      throw new ApiError(
+        errJson?.message || `Onboarding failed: HTTP ${res.status}`,
+        res.status,
+        errJson,
+        false
+      );
+    }
+
+    const json: OnboardResponse = await res.json();
+    return { data: json, isLive: true };
+  }
+
+  // MOCK mode: returns mock preview or mock hot-loaded fixture
+  if (payload.confirm) {
+    return {
+      data: {
+        ...mockOnboardHotLoaded,
+        vendor: payload.vendor,
+        device_model: payload.device_model || "generic",
+        json_path: `data/parsers/${payload.vendor.toLowerCase().replace(/[^a-z0-9_-]/g, "_")}.json`,
+        yaml_path: `data/parsers/${payload.vendor.toLowerCase().replace(/[^a-z0-9_-]/g, "_")}.yaml`,
+      },
+      isLive: false,
+    };
+  }
+
+  return {
+    data: {
+      ...mockOnboardPreview,
+      vendor: payload.vendor,
+      device_model: payload.device_model || "generic",
+      parser_definition: {
+        ...mockOnboardPreview.parser_definition,
+        vendor: payload.vendor,
+        device_model: payload.device_model || "generic",
+        sample_logs: payload.sample_lines,
+      },
+      validation_report: {
+        ...mockOnboardPreview.validation_report,
+        total_samples: payload.sample_lines.length,
+        matched_samples: payload.sample_lines.length,
+      },
+    },
+    isLive: false,
+  };
+}
+
+/**
+ * Executes safe adversarial tamper drill: POST /tamper/drill
+ * Never modifies real evidence in data/parquet/. Clones to data/scratch/ and tampers ONLY the copy.
+ */
+export async function tamperDrill(
+  payload: TamperDrillRequest
+): Promise<{
+  data: TamperDrillResponse;
+  isLive: boolean;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "LIVE") {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/tamper/drill`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(6000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach tamper drill service.",
+        0,
+        undefined,
+        true
+      );
+    }
+
+    if (!res.ok) {
+      let errJson: ApiErrorResponse | undefined;
+      try {
+        errJson = await res.json();
+      } catch {
+        // non-json
+      }
+      throw new ApiError(
+        errJson?.message || `Tamper drill failed: HTTP ${res.status}`,
+        res.status,
+        errJson,
+        false
+      );
+    }
+
+    const json: TamperDrillResponse = await res.json();
+    return { data: json, isLive: true };
+  }
+
+  // MOCK mode
+  if (payload.confirm) {
+    return {
+      data: {
+        ...mockTamperDrillSuccess,
+        target_block_id: payload.block_id,
+        target_leaf_index: payload.leaf_index ?? 0,
+        spoofed_ip: payload.spoofed_ip || "10.99.99.99",
+        source_evidence_path: `data/parquet/block_${String(payload.block_id).padStart(5, "0")}.parquet`,
+        scratch_drill_path: `data/scratch/tamper_drill_block_${String(payload.block_id).padStart(5, "0")}.parquet`,
+      },
+      isLive: false,
+    };
+  }
+
+  return {
+    data: {
+      ...mockTamperDrillPreview,
+      target_block_id: payload.block_id,
+      target_leaf_index: payload.leaf_index ?? 0,
+      spoofed_ip: payload.spoofed_ip || "10.99.99.99",
+      source_evidence_path: `data/parquet/block_${String(payload.block_id).padStart(5, "0")}.parquet`,
+      scratch_drill_path: `data/scratch/tamper_drill_block_${String(payload.block_id).padStart(5, "0")}.parquet`,
+    },
+    isLive: false,
+  };
+}
+
+/**
+ * Fetches system settings & diagnostic scorecard: GET /system
+ * Displays batcher thresholds, queue capacity, and comparative benchmark metrics.
+ */
+export async function getSystem(): Promise<{
+  data: SystemResponse;
+  isLive: boolean;
+}> {
+  const mode = getApiMode();
+
+  if (mode === "LIVE") {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/system`, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(3000),
+      });
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      throw new ApiError(
+        "Backend Offline: Unable to reach system diagnostics service.",
+        0,
+        undefined,
+        true
+      );
+    }
+
+    if (!res.ok) {
+      let errJson: ApiErrorResponse | undefined;
+      try {
+        errJson = await res.json();
+      } catch {
+        // non-json
+      }
+      throw new ApiError(
+        errJson?.message || `Failed to fetch system scorecard: HTTP ${res.status}`,
+        res.status,
+        errJson,
+        false
+      );
+    }
+
+    const json: SystemResponse = await res.json();
+    return { data: json, isLive: true };
+  }
+
+  // MOCK mode: authoritative mock fixture replacement
+  return {
+    data: mockSystem,
+    isLive: false,
+  };
+}
+

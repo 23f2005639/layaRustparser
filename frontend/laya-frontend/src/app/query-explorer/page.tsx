@@ -9,6 +9,7 @@ import { RecordInspector } from "@/components/query-explorer/RecordInspector";
 import {
   getBlocks,
   getBlockRecords,
+  getMetrics,
   getApiMode,
   getBackendStatus,
   subscribeBackendStatus,
@@ -17,7 +18,7 @@ import {
   ApiMode,
   BackendStatus,
 } from "@/lib/api";
-import { BlockItem, StoredRecordItem, RecordsQueryParams } from "@/lib/types";
+import { BlockItem, StoredRecordItem, RecordsQueryParams, MetricsResponse } from "@/lib/types";
 import { Terminal, ArrowRight, WifiOff, RotateCcw } from "lucide-react";
 
 export default function QueryExplorerPage() {
@@ -35,6 +36,7 @@ export default function QueryExplorerPage() {
 
   // Blocks state
   const [blocks, setBlocks] = useState<BlockItem[]>([]);
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
   const [blocksLoading, setBlocksLoading] = useState(false);
   const [isLiveBlocks, setIsLiveBlocks] = useState(false);
 
@@ -146,9 +148,18 @@ export default function QueryExplorerPage() {
     async (preferredBlockId?: number, shouldFetchRecords: boolean = true) => {
       setBlocksLoading(true);
       try {
-        const res = await getBlocks();
+        const [res, metricsRes] = await Promise.all([
+          getBlocks(),
+          getMetrics().catch((err) => {
+            console.warn("Failed to fetch /metrics for query explorer:", err);
+            return null;
+          }),
+        ]);
         if (!isMountedRef.current) return;
         setBlocks(res.data);
+        if (metricsRes) {
+          setMetrics(metricsRes.data);
+        }
         setIsLiveBlocks(res.isLive);
 
         if (res.data.length > 0) {
@@ -273,7 +284,7 @@ export default function QueryExplorerPage() {
   };
 
   return (
-    <AppShell currentSection="QUERY_EXPLORER">
+    <AppShell currentSection="QUERY_EXPLORER" eps={metrics?.eps}>
       <div className="flex flex-col gap-6 max-w-[1600px] mx-auto pb-12">
         {/* Workspace Title & Workflow Breadcrumb */}
         <div className="flex flex-wrap items-center justify-between gap-4">

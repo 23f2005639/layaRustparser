@@ -1,6 +1,5 @@
 # Detailed Technical Comparison: Implemented System vs. Proposed Concept
-## Architectural Analysis of the Universal Log Pre-processing Framework (ULPF)
-**Theme:** Blockchain & Cybersecurity (SIH26156)  
+**Theme:** Blockchain & Cybersecurity  
 **Target Organization:** National Technical Research Organisation (NTRO)  
 **Scope:** Heterogeneous Perimeter Network Device Ingestion, OCSF 1.3 Normalization, RFC 6962 Merkle Tree Integrity, & Air-Gapped Heuristic AI Onboarding
 
@@ -15,16 +14,16 @@ Modern cyber defense platforms for national critical infrastructure demand three
 
 The initial proposal document ([`Ulpf-proposal.pdf`](reference/Ulpf-proposal.pdf), titled *"ULPF Deep-Dive Engineering & Architecture Specification / A-HALF"*) introduced valuable conceptual goals. However, several of its theoretical mechanisms suffered from operational flaws when evaluated against real-world network protocols and containerized air-gapped environments.
 
-This document presents an exhaustive, subsystem-by-subsystem comparative breakdown contrasting **Traditional Log Pipelines**, the **Theoretical Concept in `Ulpf -1.pdf`**, and the **Production Rust System Implemented in ULPF**.
+This document presents an exhaustive, subsystem-by-subsystem comparative breakdown contrasting **Traditional Log Pipelines**, the **theoretical proposal concept**, and the **production Rust system implemented in ULPF**.
 
 ---
 
 ## 2. High-Level Architectural Comparison Matrix
 
-| # | Subsystem Layer | Traditional Systems (Logstash / Fluentd / Splunk) | Theoretical Proposal (`Ulpf -1.pdf`) | Production ULPF Implementation (Our Codebase) | Primary Operational Advantage |
+| # | Subsystem Layer | Traditional Systems (Logstash / Fluentd / Splunk) | Theoretical proposal | Production ULPF Implementation (Our Codebase) | Primary Operational Advantage |
 | :- | :--- | :--- | :--- | :--- | :--- |
 | **1** | **Network Ingestion** | Blocking single-thread sockets; heavy OS context switches (~5k–25k EPS) | eBPF / XDP writing packets directly into Redpanda memory broker | Multi-threaded async Tokio sockets with `SO_REUSEPORT` ([`socket.rs`](../crates/ulpf-core/src/ingest/socket.rs)) | Unprivileged container portability, full TCP/UDP support, zero broker latency |
-| **2** | **Vendor Classification** | Linear regex waterfalls evaluated sequentially (O(N x m)) | Theoretical single-pass O(1) Radix tree | O(m) Aho-Corasick Multi-Pattern Automaton ([`classifier.rs`](../crates/ulpf-core/src/parser/classifier.rs)) | Instant classification in **49 nanoseconds** regardless of vendor count |
+| **2** | **Vendor Classification** | Linear regex waterfalls evaluated sequentially (O(N x m)) | Theoretical single-pass O(1) Radix tree | O(m) Aho-Corasick Multi-Pattern Automaton ([`classifier.rs`](../crates/ulpf-core/src/parser/classifier.rs)) | Sub-microsecond classification regardless of vendor count (gated test, see Subsystem 2) |
 | **3** | **Field Extraction** | Regex capture groups with heavy heap allocations (`String::clone`) | Single-pass combined parse-and-extract automaton | Two-tier architecture: classification + zero-copy byte slice extractors ([`extractors/`](../crates/ulpf-core/src/parser/extractors/)) | Zero heap string copies; memory references point directly to packet buffers |
 | **4** | **Schema Normalization** | Proprietary UEM or ad-hoc JSON dictionaries requiring custom SIEM shims | OCSF 1.9 (draft standard) | **OCSF 1.3 `NetworkActivity` (Class UID 4001)** ([`ocsf.rs`](../crates/ulpf-core/src/schema/ocsf.rs)) | Global enterprise standardization; native SIEM and Data Lake interoperability |
 | **5** | **Raw Log Preservation** | Discarded after parsing or stored without cryptographic linkage | Hash stored in Raw Vault (vulnerable to deletion) | 100% lossless `metadata.raw_data` + raw SHA-256 + time-ordered **UUIDv7** ([`parser/mod.rs`](../crates/ulpf-core/src/parser/mod.rs)) | Complete bidirectional traceability from normalized record to original raw bytes |
@@ -42,7 +41,7 @@ This document presents an exhaustive, subsystem-by-subsystem comparative breakdo
 
 ### Subsystem 1: Ingestion Plane & Network Architecture
 
-#### The Theoretical Proposal in `Ulpf -1.pdf`
+#### The proposal concept
 The PDF proposed:
 > *"eBPF / XDP Zero-Copy Ingestion: Instead of standard UDP sockets, A-HALF attaches an eBPF program directly to the NIC driver via XDP. Logs are written directly to Redpanda memory bypassing the Linux kernel network stack."*
 
@@ -63,13 +62,13 @@ We engineered an asynchronous, multi-threaded network socket engine using **Toki
   ```
 - **Independent Ingress Threads:** Multiple Tokio worker tasks bind independently to port `5140`. The Linux kernel network scheduler distributes incoming datagrams across all CPU cores without lock contention.
 - **Direct Lock-Free Channels:** Ingested packets are pushed directly into bounded in-memory MPSC channels (`tokio::sync::mpsc::channel(50_000)`), completely eliminating intermediate message brokers.
-- **Empirical Result:** Achieved **2,717,398 EPS** aggregate throughput on consumer hardware with zero packet drops and zero external dependencies.
+- **Measured Result:** **1,003,273 EPS** tiered (baseline 995,247 EPS in the same run, **1.01×**) on the 224,657-line corpus, with zero packet drops and zero external dependencies. Source: `eval_full_report.md` (2026-09-28). Reproduce: `ulpf evaluate --engine all --duration 3 --threads 16 --samples 10000 --out report.md` (release build, idle machine). The pre-build proposal targeted multi-million EPS; ~1.0M EPS is the highest measured value to date, not the target.
 
 ---
 
 ### Subsystem 2: Classification Plane & Vendor Detection
 
-#### The Theoretical Proposal in `Ulpf -1.pdf`
+#### The proposal concept
 The PDF proposed:
 > *"O(1) Rust Aho-Corasick Parser: We collapse the traditional Detect -> Parse -> Extract -> Normalize hops into a single pass. The Rust engine builds an Aho-Corasick Radix Tree in memory... mapping it directly to the OCSF 1.9 standard."*
 
@@ -93,7 +92,7 @@ We architected a clean **Two-Tier Processing Separation**:
    ];
    let ac = AhoCorasick::new(&patterns).expect("valid patterns");
    ```
-   - **Performance:** Scans the raw log buffer in **49 nanoseconds** (O(m) scan), immediately classifying the stream into `VendorKind::CiscoAsa`, `Fortinet`, `PaloAlto`, `Suricata`, `PfSense`, or `Unknown`.
+   - **Performance:** Scans the raw log buffer in **sub-microsecond time** (O(m) scan), immediately classifying the stream into `VendorKind::CiscoAsa`, `Fortinet`, `PaloAlto`, `Suricata`, `PfSense`, or `Unknown`. Gated by `test_classification_sub_microsecond_benchmark` (< 2 µs per classification). Reproduce: `cargo test -p ulpf-core --test parser_tests test_classification_sub_microsecond_benchmark`.
 2. **Tier 2: Specialized Zero-Copy Extractors:** Routes directly to the designated extractor without evaluating any unrelated parsing rules.
 
 ---
@@ -113,7 +112,7 @@ We engineered five dedicated zero-copy byte slice extractors ([`crates/ulpf-core
 - **Palo Alto (`paloalto.rs`):** Zero-copy CSV field indexer. Traverses commas directly to extract Source IP (col 7), Destination IP (col 8), NAT IPs, Ports, Rule Name, and Byte counters without a single regex execution.
 - **Suricata (`suricata.rs`):** In-place JSON parser mapping EVE-JSON fields directly to numeric types and byte slices.
 - **pfSense (`pfsense.rs`):** CSV indexer for `filterlog` BSD frames.
-- **Memory Footprint:** Zero heap copies during extraction. Field slices borrow directly from the input buffer (`&'a str`), achieving sub-microsecond extraction latency (< 1.8 µs end-to-end).
+- **Memory Footprint:** Zero heap copies during extraction. Field slices borrow directly from the input buffer (`&'a str`). End-to-end pipeline latency is measured, not estimated: tiered p50 **6.15 µs** vs baseline 106.67 µs (−94.2%) on the 224,657-line corpus. Source: `eval_full_report.md` (2026-09-28).
 
 ---
 
@@ -121,7 +120,7 @@ We engineered five dedicated zero-copy byte slice extractors ([`crates/ulpf-core
 
 #### Traditional Systems vs. Proposed Concept
 - **Traditional Systems:** Define arbitrary, proprietary schemas (e.g. Splunk CIM, Elastic ECS, or ad-hoc JSON). Integrating logs into multi-vendor SIEMs requires building and maintaining dozens of brittle mapping adapters.
-- **Proposed in `Ulpf -1.pdf`:** Referenced *"OCSF 1.9"*, which was an unreleased preliminary draft specification.
+- **Proposed:** Referenced *"OCSF 1.9"*, which was an unreleased preliminary draft specification.
 
 #### What We Implemented in Production Rust
 We implemented strict, production-grade compliance with the **Open Cybersecurity Schema Framework (OCSF 1.3 - Class UID 4001 `NetworkActivity`)** ([`crates/ulpf-core/src/schema/ocsf.rs`](../crates/ulpf-core/src/schema/ocsf.rs)):
@@ -170,9 +169,9 @@ ULPF implements **Dual-Commitment Bidirectional Traceability** ([`crates/ulpf-co
 
 ### Subsystem 6: Integrity Plane & Merkle Tree Cryptography
 
-#### Theoretical Concept in `Ulpf -1.pdf` vs. Naive Blockchains
+#### Proposal concept vs. naive blockchains
 - **Naive Blockchains / Linear Hash Chains:** Computing `Hash(i) = SHA256(Hash(i-1) || Log(i))` creates an unresolvable distributed race condition. If logs arrive on multiple CPU cores or network partitions, linear chaining requires a global mutex lock, throttling throughput to < 10,000 EPS.
-- **Proposed in `Ulpf -1.pdf`:** Mentioned batch-based Merkle trees from RFC 6962, but provided only theoretical formulas without runnable code, tree-balancing algorithms, inclusion proof generation, or ledger anchoring.
+- **Proposed:** Mentioned batch-based Merkle trees from RFC 6962, but provided only theoretical formulas without runnable code, tree-balancing algorithms, inclusion proof generation, or ledger anchoring.
 
 #### What We Implemented in Production Rust
 We engineered an enterprise implementation of the **RFC 6962 Certificate Transparency Standard Merkle Tree** ([`crates/ulpf-integrity/src/merkle.rs`](../crates/ulpf-integrity/src/merkle.rs)):
@@ -180,7 +179,7 @@ We engineered an enterprise implementation of the **RFC 6962 Certificate Transpa
    - **Leaf Nodes:** `SHA256(0x00 || raw_bytes)`
    - **Internal Nodes:** `SHA256(0x01 || left || right)`
 2. **Arbitrary Leaf Count Balancing:** Gracefully handles odd leaf counts (N) via RFC 6962 tree balancing rather than naive zero-padding.
-3. **O(log N) Inclusion Proofs:** To verify that Log #7,432 out of a 10,000-log block was untouched, ULPF generates an audit path of just `ceil(log2(10000)) = 14` hashes. Verification takes under **1.2 microseconds**.
+3. **O(log N) Inclusion Proofs:** To verify that Log #7,432 out of a 10,000-log block was untouched, ULPF generates an audit path of just `ceil(log2(10000)) = 14` hashes. Verification completes in microseconds on a laptop CPU. Reproduce: `./target/release/ulpf verify --file data/parquet/block_00001.parquet --ledger data/ledger.jsonl` (exit 0 = valid).
 4. **Dual-Trigger Batch Accumulator** ([`crates/ulpf-integrity/src/batcher.rs`](../crates/ulpf-integrity/src/batcher.rs)):
    Flushes a block when:
    `Event Count >= 1,000 OR Duration >= 2,000 ms`
@@ -237,7 +236,7 @@ We engineered an automated forensic audit engine ([`crates/ulpf-integrity/src/ta
 
 ### Subsystem 9: AI & Anomaly Detection Plane
 
-#### The Theoretical Proposal in `Ulpf -1.pdf`
+#### The proposal concept
 The PDF proposed:
 > *"A-HALF asynchronously feeds all unmapped fields into a lightweight MiniLM vector embedding model. We apply HDBSCAN (Hierarchical Density-Based Spatial Clustering of Applications with Noise) to the stream."*
 
@@ -249,7 +248,7 @@ The PDF proposed:
 #### What We Implemented in Production Rust
 We engineered a native Rust implementation of the **Drain3 Log Template Miner** (based on the LogPai algorithm) ([`crates/ulpf-ai/src/drain.rs`](../crates/ulpf-ai/src/drain.rs)):
 - **Fixed-Depth Prefix Tree (Depth = 4):** Tokenizes incoming logs by whitespace, masks dynamic parameters (IPs, ports, session IDs, timestamps) into `<*>`, and searches the prefix tree.
-- **Microsecond Latency:** Clusters logs into template buckets in **< 10 microseconds on a single CPU core** with **zero GPU requirements**.
+- **Microsecond Latency:** Clusters logs into template buckets in **tens of microseconds on a single CPU core** with **zero GPU requirements** (release gate: < 25 µs avg in `ai_tests.rs`). Reproduce: `cargo test --release -p ulpf-ai --test ai_tests drain`.
 - **Structural Evasion Anomaly Alerts:** Tracks cluster occurrence frequencies. If an attacker sends malformed evasion packets, Drain3 clusters them into a rare template and alerts in real time:
   `[SECURITY ALERT] Surge in rare log cluster #42 (Possible evasion / parser drift)`
 
@@ -257,7 +256,7 @@ We engineered a native Rust implementation of the **Drain3 Log Template Miner** 
 
 ### Subsystem 10: Device Onboarding & Heuristic Regex Synthesis
 
-#### The Theoretical Proposal in `Ulpf -1.pdf`
+#### The proposal concept
 The PDF proposed:
 > *"Neuro-Symbolic Program Synthesis: 1. Neural Step: The LLM (DeepSeek) is only used for Semantic Labeling. 2. Symbolic Step: A deterministic Rust synthesis engine takes these labeled examples and mathematically derives the strictest possible Regex."*
 
@@ -280,9 +279,9 @@ We engineered a **100% Air-Gapped Deterministic Heuristic Synthesizer** ([`crate
 
 ---
 
-## 4. Summary Scorecard: SIH26156 Requirements Compliance
+## 4. Summary Scorecard: Requirements Compliance
 
-| SIH Requirement | Problem Statement Specification | Implementation Verification |
+| Requirement | Problem Statement Specification | Implementation Verification |
 | :---: | :--- | :---: |
 | **(a)** | Preserve complete raw event data without loss | **100% Covered** (`metadata.raw_data` + raw SHA-256) |
 | **(b)** | Extract and parse source-specific attributes | **100% Covered** (Zero-copy extractors for Cisco, Fortinet, PAN-OS, Suricata, pfSense) |
@@ -294,15 +293,18 @@ We engineered a **100% Air-Gapped Deterministic Heuristic Synthesizer** ([`crate
 | **(h)** | AI/ML-ready security and operational analytics | **100% Covered** (Columnar storage + Drain3 structural cluster IDs) |
 | **(i)** | Reduced parser development effort | **100% Covered** (Parser creation slashed from days to < 4 milliseconds) |
 | **(j)** | Deployable in an air-gapped network | **100% Covered** (100% self-contained native Rust; zero cloud APIs; zero GPU weights) |
-| **(k)** | Packaged in a container for platform independence | **100% Covered** (Multi-stage Docker build producing < 35 MB lean image) |
+| **(k)** | Packaged in a container for platform independence | **Partial** (binary ≈ 22.8 MB meets the < 35 MB target; image slim-down open — see [`SRS.md`](SRS.md) §3.k and issue #45) |
 
-**Conclusion:** All 11 expected requirements (100%) are fully implemented, verified, and demonstrated in production Rust code.
+> **Note (2026-09-29):** row (k) was corrected from "100% Covered" to Partial;
+> per-requirement verdicts now live in [`SRS.md`](SRS.md), which this table defers to.
+
+**Conclusion:** 10 of 11 requirements are fully implemented and verified. Requirement (k) — container image size — is partial: the binary meets the target (22.8 MB < 35 MB); the container image does not. See §3.k and SRS.md.
 
 ---
 
 ## 5. References (carried over from the original SRS)
 
-> Salvaged from `Ulpf.md` (the pre-build proposal SRS, removed from the repo because it describes unbuilt Python-stack architecture) so the research trail is not lost. All Sep 2026. Primary sources, not blogs.
+> Salvaged from the pre-build proposal document (no longer in the repo; it describes unbuilt Python-stack architecture) so the research trail is not lost. All Sep 2026. Primary sources, not blogs.
 
 1. OCSF 1.4.0 — `https://schema.ocsf.io/1.4.0/` & Release `https://github.com/ocsf/ocsf-schema/releases/tag/1.4.0` (2025-02-05).
 2. OCSF 1.8 — `tag/1.8.0` (Mar 16 2026) — `ai_operation`.

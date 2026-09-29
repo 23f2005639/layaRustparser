@@ -1,12 +1,12 @@
 # ULPF Future Scope — measured gaps, in priority order
 
-> Source: vanilla-vs-3-tier duel (`eval_duel_report.md`), frozen holdout
-> (`eval_holdout_report.md`), release benchmarks. Nothing here is
+> Source: vanilla-vs-3-tier duel (`docs/benchmarks/eval_duel_report.md`), frozen holdout
+> (`docs/benchmarks/eval_holdout_report.md`), release benchmarks. Nothing here is
 > speculative — every item traces to a measured number. Rule for all
 > future work: **no tuning against the corpus that exposed the gap**
 > (fresh validation data only).
 
-## 1. Vendor expansion — P10.2 (highest return)
+## 1. Vendor expansion (highest return)
 
 **Gap:** holdout disposition 0/0 — no extractor means `Unknown` fields and
 disposition on every line of an unseen vendor (baseline VCA 0%, tiered 40%
@@ -34,13 +34,15 @@ only the runbook.
 dispositions (vanilla 17/53). Root cause: a relay prefix or mid-line CR
 keeps a space in the payload, the whitespace tokenizer path fuses the
 CSV/JSON into one token, and the buried action word never reaches the
-anchor vocabulary (`eval_duel_report.md` disclosure).
+anchor vocabulary (`docs/benchmarks/eval_duel_report.md` disclosure).
 **Work:** fix on principle (comma-aware split / prefix strip), then
 validate on a **newly generated fuzz corpus (new seed)** — R2 stays
 labelled "discovery corpus" forever and is never re-reported as blind.
 **Done when:** fresh-corpus mixed clusters drop with GA non-regressing.
 
-## 4. Benchmark ritual (methodology, zero code)
+## 4. Benchmark ritual (methodology, zero code) — DONE
+
+> **Status: done** — ritual documented in `AGENTS.md` Gotchas (canonical), condensed in `docs/SCORECARDS.md`, enforced by `scripts/bench.sh`. Section closed; do not reopen.
 
 **Gap:** wall-clock latency swings with machine load (baseline p50 seen
 73 µs idle → 1,104 µs busy); small-corpus tiered throughput 0.82–0.97×

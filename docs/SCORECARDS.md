@@ -23,9 +23,13 @@ Each metric below shows how it is graded: the exact definition, the line in [`cr
 
 **Ground-truth policy:** where a sidecar exists it wins over in-line derivation (`:1693–1703`), because fuzz mutations destroy the in-line markers. On the adversarial and holdout corpora the sidecar is therefore the only reliable ground truth left. The core corpus (1,720 lines) has no sidecar; its GT comes from the lines themselves. Sidecars exist for adversarial (757), holdout (200) and full-scale (224,657 — see the 1,000,000-correct-field table in the README headline results).
 
-† **About the old name "Macro F1":** this number is the mean of five exact-match field accuracies (`evaluator.rs:1970`), never a precision/recall F1 — the label is retired in code and every re-runnable report. The frozen holdout report (`eval_holdout_report.md`, P8) and the historical logs (`OVERHAUL_PLAN.md`, `FULL_DATASET_RESULTS.md`) still carry the old label; read it as mean field accuracy.
+† **About the old name "Macro F1":** this number is the mean of five exact-match field accuracies (`evaluator.rs:1970`), never a precision/recall F1 — the label is retired in code and every re-runnable report. The frozen holdout report (`benchmarks/eval_holdout_report.md`, frozen at evaluation cutoff) and the historical logs (`docs/archive/OVERHAUL_PLAN.md`, `FULL_DATASET_RESULTS.md`) still carry the old label; read it as mean field accuracy.
 
-## 4.1 Core corpus — 1,720 committed fixture lines · [`eval_hardcore_report.md`](../eval_hardcore_report.md)
+### Benchmark ritual (the stopwatch rules — condensed)
+
+Latency/throughput rows are only comparable when measured the same way: idle machine (`uptime` 1-min loadavg < `nproc`), `--release` binary, pinned `--threads` (same value both engines), median of 3 runs per corpus, always the same-run baseline-vs-tiered ratio — absolute µs never stands alone (same corpus seen 73 µs idle → 1,104 µs busy). Noise band: same-run ratios within ~10%; absolute µs not comparable across machines. Small-corpus tiered throughput 0.82–0.97× is **designed** (Drain bookkeeping the pure baseline skips; tiers pay off at scale — 2.15× at 224k), not chased. Ritual enforced by [`scripts/bench.sh`](../scripts/bench.sh); canonical text in `AGENTS.md` Gotchas.
+
+## 4.1 Core corpus — 1,720 committed fixture lines · [`eval_hardcore_report.md`](benchmarks/eval_hardcore_report.md)
 
 | Metric | Baseline | 3-Tier | Delta |
 | :--- | ---: | ---: | :---: |
@@ -38,18 +42,18 @@ Each metric below shows how it is graded: the exact definition, the line in [`cr
 | Unique templates (compression) | 1,407 | **73** | **19.3× fewer** |
 | Audit-dump mismatches | — | **0 / 1,720** | clean |
 
-## 4.2 Full scale — 224,657 lines / 183 MB · [`eval_full_report.md`](../eval_full_report.md)
+## 4.2 Full scale — 224,657 lines / 183 MB · [`eval_full_report.md`](benchmarks/eval_full_report.md)
 
 | Metric | Baseline | 3-Tier | Delta |
 | :--- | ---: | ---: | :---: |
-| Throughput | 395,842 EPS | **849,481 EPS** | **2.15×** |
-| Data bandwidth | 77.68 MB/s | **237.26 MB/s** | **3.05×** |
+| Throughput | 995,247 EPS | **1,003,273 EPS** | **1.01×** |
+| Data bandwidth | 265.80 MB/s | **268.42 MB/s** | **1.01×** |
 | VCA / GA / TA / MeanAcc / Disposition | 100 / 100 / 100 / 100 / 100 % | **100 / 100 / 100 / 100 / 100 %** | = (ceiling) |
 | Unique templates | 137,986 | **32** | **4,312× compression** |
 | Sidecar GT (5 field keys) | — | **1,000,000 correct · 0 wrong** | exact match |
 | Audit-dump mismatches | — | **0 / 224,657** | clean |
 
-## 4.3 Adversarial corpus (deterministic fuzz) · [`eval_adversarial_report.md`](../eval_adversarial_report.md)
+## 4.3 Adversarial corpus (deterministic fuzz) · [`eval_adversarial_report.md`](benchmarks/eval_adversarial_report.md)
 
 | Metric | Baseline | 3-Tier | Note |
 | :--- | ---: | ---: | :--- |
@@ -57,9 +61,9 @@ Each metric below shows how it is graded: the exact definition, the line in [`cr
 | GA | 100.00% | 98.41% | −1.59 pt: deny-class variants only (see README limitations) |
 | TA / MeanAcc / Disposition | 100 / 97.15 / 93.53 % | **100** / 97.15 / 93.53 % | parity |
 | Action Inviolability | N/A | **100% preserved** | anchor tokens held under fuzz |
-| GT fields wrong | 1,524 | **1,524 (identical)** | fuzzer-caused; engine delta = 0 |
+| GT fields wrong | 1,512 | **1,512 (identical)** | fuzzer-caused; engine delta = 0 |
 
-## 4.4 Frozen holdout (unseen vendors, executed once at P8) · [`eval_holdout_report.md`](../eval_holdout_report.md)
+## 4.4 Frozen holdout (unseen vendors, executed once at evaluation cutoff) · [`eval_holdout_report.md`](benchmarks/eval_holdout_report.md)
 
 | Metric | Baseline | 3-Tier |
 | :--- | ---: | ---: |
@@ -67,22 +71,22 @@ Each metric below shows how it is graded: the exact definition, the line in [`cr
 | GT fields correct | 0 | **320** |
 | GT fields wrong | 720 | **400** (−44%) |
 | TA | 100.00% | **100.00%** |
-| Field F1 † | 64.00% | **80.00%** |
+| Mean Field Accuracy † | 64.00% | **80.00%** |
 
 > The holdout is **frozen**: never regenerated, never re-run post-freeze. Its report timestamp (`2026-09-24T09:41:32Z`) is the audit trail.
 
 ## Latency spectrum & template compression
 
-Full-scale percentile sweep ([`eval_full_report.md`](../eval_full_report.md) §2):
+Full-scale percentile sweep ([`eval_full_report.md`](benchmarks/eval_full_report.md) §2):
 
 | Percentile | Baseline | 3-Tier | Reduction |
 | :--- | ---: | ---: | ---: |
-| p1 (fastest 1%) | 512.25 µs | **5.97 µs** | −98.8% |
-| **p50 (median)** | 1,104.72 µs | **7.28 µs** | **−99.3%** |
-| p90 | 1,377.28 µs | **8.12 µs** | −99.4% |
-| p99 | 1,510.92 µs | **10.97 µs** | −99.3% |
-| p99.9 | 1,729.33 µs | **14.93 µs** | −99.1% |
-| worst case | 4,328.61 µs | **50.08 µs** | −98.8% |
+| p1 (fastest 1%) | 104.02 µs | **5.16 µs** | −95.0% |
+| **p50 (median)** | 106.67 µs | **6.15 µs** | **−94.2%** |
+| p90 | 139.39 µs | **6.71 µs** | −95.2% |
+| p99 | 165.42 µs | **9.86 µs** | −94.0% |
+| p99.9 | 208.81 µs | **27.54 µs** | −86.8% |
+| worst case | 371.45 µs | **60.66 µs** | −83.7% |
 
 **Template compression** (why a SIEM would care): 224,657 raw lines collapse to **32 Drain templates** (baseline naive-split: 137,986) — a **4,312× reduction** in downstream indexing cost with TA held at 100% (every template still generalizes correctly against its masked line).
 
@@ -115,6 +119,6 @@ $ echo $?
 2
 ```
 
-Machine-readable exit codes (**P10.0**): **`0` = valid · `1` = missing input / IO error · `2` = tamper detected**. (`block_00000.parquet` is *deliberately* tampered in-repo so the failure path is demonstrable out of the box; `block_00001.parquet` is the valid control.)
+Machine-readable exit codes: **`0` = valid · `1` = missing input / IO error · `2` = tamper detected**. (`block_00000.parquet` is *deliberately* tampered in-repo so the failure path is demonstrable out of the box; `block_00001.parquet` is the valid control.)
 
-The live ingest chain at full scale wrote **186 Parquet blocks with 186/186 verifying PASS** ([`FULL_DATASET_RESULTS.md`](../FULL_DATASET_RESULTS.md) §4) — SIGTERM flushes the in-flight batch, closing the tail-loss window found during P9.
+The live ingest chain at full scale wrote **186 Parquet blocks with 186/186 verifying PASS** ([`FULL_DATASET_RESULTS.md`](../FULL_DATASET_RESULTS.md) §4) — SIGTERM flushes the in-flight batch, closing the tail-loss window found during the live-ingest hardening pass.

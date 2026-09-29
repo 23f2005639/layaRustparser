@@ -16,7 +16,7 @@ How the common shippers handle those same three problems, from their own documen
 | **Logstash** (Elastic, JVM) | JVM heap — typically hundreds of MB to GB | hand-written `grok` patterns | none | no: plugin installs pull from the internet |
 | **Fluentd** | Ruby + native C, ~100 MB class | hand-written filter plugins | none | no: `gem install` pulls from the internet |
 | **Splunk Universal Forwarder** | proprietary agent | Splunk CIM, paid license | none | partial: offline package, licensed |
-| **ULPF** (this repo) | single **18.6 MB** static Rust binary | OCSF 1.3, automatic (zero-copy extractors + Drain) | yes: RFC 6962 Merkle root → append-only ledger → Parquet WORM, exit-code audit | yes: zero network calls by design |
+| **ULPF** (this repo) | single **22.8 MB** static Rust binary | OCSF 1.3, automatic (zero-copy extractors + Drain) | yes: RFC 6962 Merkle root → append-only ledger → Parquet WORM, exit-code audit | yes: zero network calls by design |
 
 ULPF answers all three: **Rust zero-copy hot path** (slices `&[u8]`, no per-packet allocation), **RFC 6962 Merkle chaining** (deleting or editing *any* byte of *any* row breaks a verifiable root anchored in an append-only ledger), and **OCSF 1.3 normalization** as the single output schema.
 
@@ -32,10 +32,10 @@ Transcribed from the `VendorFormat` enum and prefix table in [`crates/ulpf-core/
 | EVE JSON — **Suricata** | `{"timestamp":` · `"event_type":` · `"flow":` · `"alert":` | `suricata.rs` | supported |
 | filterlog — **pfSense** | `filterlog[` · `filterlog:` | `pfsense.rs` | supported |
 | **CEF** envelope (vendor-neutral) | `CEF:` | `cef.rs` | supported |
-| LEEF · generic `key=value` · flat JSON · XML · RFC 5424 (structured data) | — | — | planned, P10.1 (README roadmap) |
+| LEEF · generic `key=value` · flat JSON · XML · RFC 5424 (structured data) | — | — | planned (README roadmap) |
 | anything else | — | generic fallback event — vendor `Unknown`, **never silently dropped** | by design |
 
-About 10 more vendors (ISRO-relevant) are planned for P10.2 (README roadmap). You do not have to wait for that code: `ulpf onboard` synthesises and validates a parser from 3–5 sample lines, fully offline (README quick start, step 7).
+About 10 more vendors (ISRO-relevant) are planned (README roadmap). You do not have to wait for that code: `ulpf onboard` synthesises and validates a parser from 3–5 sample lines, fully offline (README quick start, step 7).
 
 ## One real line, end to end
 

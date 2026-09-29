@@ -1,8 +1,8 @@
 # ULPF Hardcore Architectural & Accuracy Telemetry Report
 
-**Timestamp:** 2026-09-25T03:53:02.780046251+00:00  
+**Timestamp:** 2026-09-28T23:27:41.955983433+00:00  
 **Environment:** Linux (x86_64, 16 Cores) | **Workers:** 16 parallel threads  
-**Duration:** 3s per engine | **Corpus:** 224657 logs (62241.99 KB)  
+**Duration:** 3s per engine | **Corpus:** 1720 logs (565.78 KB)  
 **Corpus Kind:** `core` (core = fixed file set, adversarial/holdout = sidecar-GT corpora)  
 
 ---
@@ -11,15 +11,15 @@
 
 | Benchmark Dimension | Baseline (`UniversalParser`) | 3-Tier (`LRU+Drain+Laya`) | Speedup / Delta |
 | :--- | :---: | :---: | :---: |
-| **Throughput (EPS)** | **966681 EPS** | **74489 EPS** | **0.08x** |
-| **Data Bandwidth (MB/s)** | **263.04 MB/s** | **12.23 MB/s** | **0.05x** |
-| **Median Latency (p50)** | 73.64 µs | **47.31 µs** | **-35.8%** |
-| **99th %ile Latency (p99)** | 127.92 µs | **96.07 µs** | **-24.9%** |
+| **Throughput (EPS)** | **790662 EPS** | **763813 EPS** | **0.97x** |
+| **Data Bandwidth (MB/s)** | **253.89 MB/s** | **245.30 MB/s** | **0.97x** |
+| **Median Latency (p50)** | 106.18 µs | **3.84 µs** | **-96.4%** |
+| **99th %ile Latency (p99)** | 190.96 µs | **10.26 µs** | **-94.6%** |
 | **Vendor Classification (VCA)** | **100.00%** | **100.00%** | Ground-Truth Exact Match |
 | **Grouping Accuracy (GA %)** | **100.00%** | **100.00%** | Loghub-2.0 Standard |
 | **Template Accuracy (TA %)** | **100.00%** | **100.00%** | Template Validity (generalization-correct vs masked line) |
 | **Oracle GA Ceiling (GT-hash, unfair)** | **100.00%** | **100.00%** | Labeled Ceiling — Not a Fair Baseline |
-| **Unique Templates (compression)** | **137986** | **32** | Strictly Fewer vs Naive Baseline (§5.2) |
+| **Unique Templates (compression)** | **1407** | **73** | Strictly Fewer vs Naive Baseline (§5.2) |
 | **Field Extraction Mean Accuracy** | **100.00%** | **100.00%** | IP/Port/Proto Extraction |
 | **Disposition Resolution Accuracy** | **100.00%** | **100.00%** | OCSF Action Mapping |
 | **Action Inviolability** | N/A | **100% PRESERVED** | `ALLOW`/`DENY` isolated |
@@ -28,25 +28,25 @@
 
 | Robustness Dimension | Baseline | 3-Tier (`LRU+Drain+Laya`) | Gate Meaning |
 | :--- | ---: | ---: | :--- |
-| **Lines Audited** | 224657 | 224657 | Full corpus, every line scored |
-| **Format Recognized** | 224657 | 224657 | Vendor routed to a known format (not `unknown`) |
-| **No Panic** | 224657 | 224657 | `catch_unwind` parse, zero aborts |
-| **Lossless (SHA-256 match)** | 224657 | 224657 | `raw_hash` == SHA-256(raw), byte-exact |
-| **Sidecar GT fields graded** | 1000000 | 1000000 | Non-null expectations (correct + wrong) |
-| **GT fields correct** | 1000000 | 1000000 | Engine matched the expectation |
+| **Lines Audited** | 1720 | 1720 | Full corpus, every line scored |
+| **Format Recognized** | 1720 | 1720 | Vendor routed to a known format (not `unknown`) |
+| **No Panic** | 1720 | 1720 | `catch_unwind` parse, zero aborts |
+| **Lossless (SHA-256 match)** | 1720 | 1720 | `raw_hash` == SHA-256(raw), byte-exact |
+| **Sidecar GT fields graded** | 0 | 0 | Non-null expectations (correct + wrong) |
+| **GT fields correct** | 0 | 0 | Engine matched the expectation |
 | **GT fields wrong** | 0 | 0 | Contradicted expectation (strictly worse than null) |
-| **GT fields null (honest)** | 123285 | 123285 | No expectation — excluded from wrong |
+| **GT fields null (honest)** | 0 | 0 | No expectation — excluded from wrong |
 
 ## 2. Microsecond Latency Spectrum
 
 | Percentile Observation | Baseline (µs) | 3-Tier Engine (µs) | Latency Reduction |
 | :--- | :---: | :---: | :---: |
-| **p1 (Fastest 1%)** | 68.03 µs | 39.09 µs | -42.5% |
-| **p50 (Median)** | 73.64 µs | 47.31 µs | -35.8% |
-| **p90** | 86.82 µs | 67.86 µs | -21.8% |
-| **p99** | 127.92 µs | 96.07 µs | -24.9% |
-| **p99.9 (Three Nines)** | 200.05 µs | 216.65 µs | --8.3% |
-| **Worst Case (Max)** | 291.90 µs | 324.89 µs | --11.3% |
+| **p1 (Fastest 1%)** | 101.07 µs | 2.05 µs | -98.0% |
+| **p50 (Median)** | 106.18 µs | 3.84 µs | -96.4% |
+| **p90** | 148.92 µs | 6.92 µs | -95.4% |
+| **p99** | 190.96 µs | 10.26 µs | -94.6% |
+| **p99.9 (Three Nines)** | 276.41 µs | 26.93 µs | -90.3% |
+| **Worst Case (Max)** | 440.73 µs | 73.86 µs | -83.2% |
 
 ## 3. Academic Accuracy & Quality Breakdown
 

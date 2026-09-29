@@ -6,9 +6,9 @@ import { AppShell } from "@/components/layout/AppShell";
 import { SiemKpiRibbon } from "@/components/siem/SiemKpiRibbon";
 import { IncidentQueue } from "@/components/siem/IncidentQueue";
 import { ForensicWorkspace } from "@/components/siem/ForensicWorkspace";
-import { getAlerts, getApiMode } from "@/lib/api";
-import { AlertItem } from "@/lib/types";
-import { mockAlerts } from "@/lib/mock-data";
+import { getAlerts, getMetrics, getApiMode } from "@/lib/api";
+import { AlertItem, MetricsResponse } from "@/lib/types";
+import { mockAlerts, mockMetrics } from "@/lib/mock-data";
 import { Zap } from "lucide-react";
 
 function SiemAlertingContent() {
@@ -136,8 +136,45 @@ function SiemAlertingContent() {
 }
 
 export default function SiemAlertingPage() {
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    let timerId: NodeJS.Timeout | null = null;
+
+    async function loadMetrics() {
+      const mode = getApiMode();
+      if (mode === "MOCK") {
+        setMetrics(mockMetrics);
+        return;
+      }
+      try {
+        const res = await getMetrics();
+        if (!active) return;
+        setMetrics(res.data);
+      } catch {
+        if (!active) return;
+        setMetrics(null);
+      }
+    }
+
+    async function pollLoop() {
+      if (!active) return;
+      await loadMetrics();
+      if (!active) return;
+      timerId = setTimeout(pollLoop, 1000);
+    }
+
+    pollLoop();
+
+    return () => {
+      active = false;
+      if (timerId) clearTimeout(timerId);
+    };
+  }, []);
+
   return (
-    <AppShell currentSection="SIEM_ALERTS">
+    <AppShell currentSection="SIEM_ALERTS" eps={metrics?.eps}>
       <Suspense
         fallback={
           <div className="p-8 text-center text-[#64748B] font-mono text-[0.875rem]">
