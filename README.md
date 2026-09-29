@@ -15,7 +15,7 @@
 
 3.84 µs per log. 1,003,273 events per second. 100% action inviolability. 4,312× template compression. 186/186 blocks verify PASS. Zero cloud. Zero data loss.
 
-New here? Ask questions about the codebase in plain English on our [DeepWiki](https://deepwiki.com/guptchar/layaRustparser) (in-repo docs are authoritative on any disagreement).
+New here? Ask questions about the codebase in plain English on our [DeepWiki](https://deepwiki.com/guptchar/layaRustparser)
 
 ![ULPF end-to-end flow: raw syslog/JSON/CSV -> classify -> zero-copy parse -> OCSF 1.3 JSON -> Parquet WORM + verify, with SHA-256(raw) / UUIDv7 -> RFC 6962 Merkle root -> ledger.jsonl provenance branch](docs/diagrams/hero-flow.png)
 
