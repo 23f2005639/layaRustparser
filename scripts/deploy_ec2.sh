@@ -36,8 +36,17 @@ echo "    Rust:   $(cargo --version)"
 echo "    Node:   $(node --version)"
 echo "    Commit: $(git rev-parse --short HEAD) - $(git log -1 --pretty=%s)"
 
-# 2. Compile Rust Backend Binaries
+# 2. Compile Rust Backend Binaries (Lean Mode)
 echo "==> [2/5] Compiling Rust release binaries..."
+export CARGO_INCREMENTAL=0
+
+# Truncate logs if they exceed 10MB to save space
+for logfile in "$APP_DIR/serve.log" "$APP_DIR/frontend.log" "$APP_DIR/ingest.log"; do
+    if [ -f "$logfile" ] && [ $(stat -c%s "$logfile" 2>/dev/null || echo 0) -gt 10485760 ]; then
+        truncate -s 2M "$logfile"
+    fi
+done
+
 cargo build --release -p ulpf-cli
 
 if [ ! -f "$APP_DIR/target/release/ulpf" ]; then
@@ -45,6 +54,10 @@ if [ ! -f "$APP_DIR/target/release/ulpf" ]; then
     exit 1
 fi
 echo "    Binary compiled successfully: $(ls -lh target/release/ulpf | awk '{print $5, $9}')"
+
+# Free up intermediate compile objects while keeping the binary
+rm -rf "$APP_DIR/target/release/incremental" "$APP_DIR/target/debug" 2>/dev/null || true
+
 
 # 3. Build Next.js Production Frontend
 echo "==> [3/5] Building Next.js frontend..."
