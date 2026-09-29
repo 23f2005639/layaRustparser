@@ -678,7 +678,6 @@ mod tests {
 
     /// Minimal SHA-256 for the wire-equality test below. Test-only, kept here
     /// so the benchmark binary gains no new dependency for a test assertion.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn sha256_hex(data: &[u8]) -> String {
         const K: [u32; 64] = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -702,7 +701,7 @@ mod tests {
             msg.push(0);
         }
         msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
-        for chunk in msg.chunks_exact(64) {
+        for chunk in msg.as_chunks::<64>().0 {
             let mut w = [0u32; 64];
             for i in 0..16 {
                 w[i] = u32::from_be_bytes([
