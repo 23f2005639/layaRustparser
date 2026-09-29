@@ -22,7 +22,10 @@ export function OcsfStreamTable({ records, status = "LIVE" }: OcsfStreamTablePro
   };
 
   return (
-    <div className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm">
+    <div
+      data-tour="ocsf-table"
+      className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm"
+    >
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#F1F5F9]">
         <div className="flex items-center gap-2.5">

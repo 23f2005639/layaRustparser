@@ -76,7 +76,10 @@ export function PerformanceChart({
   const latestEpsCoord = epsCoords[epsCoords.length - 1] || { x: width, y: 44 };
 
   return (
-    <div className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm">
+    <div
+      data-tour="performance-chart"
+      className="flex flex-col bg-white p-4 rounded-xl border border-[#E2E8F0] shadow-sm"
+    >
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-2 pb-3">
         <div className="flex items-center gap-2">
@@ -106,7 +109,7 @@ export function PerformanceChart({
               Telemetry stream offline
             </span>
             <span className="font-mono text-[0.75rem] text-[#64748B] mt-1 text-center">
-              Backend is not responding on http://127.0.0.1:8080/metrics
+              Backend is not responding on /metrics
             </span>
           </div>
         )}
