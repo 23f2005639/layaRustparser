@@ -47,13 +47,13 @@ for logfile in "$APP_DIR/serve.log" "$APP_DIR/frontend.log" "$APP_DIR/ingest.log
     fi
 done
 
-cargo build --release -p ulpf-cli
+cargo build --release -p ulpf-cli -p ulpf-generator
 
 if [ ! -f "$APP_DIR/target/release/ulpf" ]; then
     echo "ERROR: Expected binary $APP_DIR/target/release/ulpf was not generated."
     exit 1
 fi
-echo "    Binary compiled successfully: $(ls -lh target/release/ulpf | awk '{print $5, $9}')"
+echo "    Binaries compiled successfully: $(ls -lh target/release/ulpf | awk '{print $5, $9}')"
 
 # Free up intermediate compile objects while keeping the binary
 rm -rf "$APP_DIR/target/release/incremental" "$APP_DIR/target/debug" 2>/dev/null || true
@@ -80,22 +80,8 @@ if systemctl is-active --quiet ulpf-backend.service 2>/dev/null || systemctl is-
         sudo systemctl restart ulpf-ingest.service || true
     fi
 else
-    echo "    Systemd units not found. Using daemon process supervisor..."
-    # Gracefully terminate previous instances
-    pkill -f "ulpf serve" 2>/dev/null || true
-    pkill -f "next-server" 2>/dev/null || true
-    pkill -f "node.*start" 2>/dev/null || true
-    sleep 2
-
-    # Launch Rust Backend REST API
-    echo "    Launching Rust backend (port 8080)..."
-    nohup "$APP_DIR/target/release/ulpf" serve --port 8080 --host 0.0.0.0 > "$APP_DIR/serve.log" 2>&1 &
-    
-    # Launch Next.js Frontend Server
-    echo "    Launching Next.js frontend (port 3000)..."
-    cd "$APP_DIR/frontend/laya-frontend"
-    nohup npm run start -- -p 3000 -H 0.0.0.0 > "$APP_DIR/frontend.log" 2>&1 &
-    cd "$APP_DIR"
+    echo "    Systemd units not found. Starting full demo stack via start_demo_stack.sh..."
+    "$APP_DIR/scripts/start_demo_stack.sh"
 fi
 
 # 5. Health Check Audit
